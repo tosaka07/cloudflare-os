@@ -554,6 +554,16 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     profile.type = "agent";
+    // An Azure deployment name is unique only within its own resource, so -- unlike every other
+    // provider's model id -- it can collide with a global one: a deployment named
+    // "gpt-5.6-luna" would be shadowed by the gateway's built-in model of that name, both in
+    // listModels() and in getChatContext(), which resolves gateway models first. Qualify the
+    // record's id so the two can coexist. The model lists render this id beneath the display
+    // name, so the qualified form is visible to the user -- which is the point: it is what
+    // distinguishes an Azure deployment from the built-in model it shares a name with.
+    if (config.provider === "azure-openai" && config.azure) {
+      profile.id = `azure-openai:${config.azure.resourceName}:${config.model}`;
+    }
     this.storage.aiModels.put({profile, config});
   }
 
