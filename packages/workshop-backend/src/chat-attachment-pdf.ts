@@ -16,7 +16,8 @@ import type { Api } from "@earendil-works/pi-ai";
 //   "data:application/pdf;base64,..."}; OpenAI wants {type: "input_file", filename, file_data}
 //   with the same data URL. The filename is synthesized -- the payload no longer knows the
 //   original name, which the replay instead surfaces in an adjacent text part.
-// - openai-completions (Workers AI, Ollama): no document input exists; uploads are rejected
+// - openai-completions (Workers AI, Ollama, Azure OpenAI): no document input exists; uploads
+//   are rejected
 //   (chat-attachment-validation.ts) and replay degrades a PDF to a text marker.
 //
 // Drop this bridge if pi gains a first-class document content type (upstream ask filed; see

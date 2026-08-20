@@ -1133,7 +1133,8 @@ export type CloudflareAccountOption = {
 };
 
 /** Supported AI providers. */
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+export type AiModelProvider =
+    "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "azure-openai";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -1166,7 +1167,46 @@ export type AiModelConfig = {
    * alternative provider that provides a compatible API.
    */
   apiUrl?: string;
+
+  /**
+   * Which Azure OpenAI deployment to reach. Required for provider "azure-openai", whose AI
+   * Gateway route names the resource and deployment in its path; unused for other providers.
+   */
+  azure?: AzureOpenAiDeployment;
 };
+
+/**
+ * Locates an Azure OpenAI deployment. The deployment name itself is `AiModelConfig.model`, since
+ * an Azure request names a deployment where other providers name a model; this carries what the
+ * endpoint needs on top of that. Azure OpenAI is reachable only through an AI Gateway, which
+ * holds the Azure API key, so no credential appears here.
+ */
+export type AzureOpenAiDeployment = {
+  /** Resource name, i.e. the `{name}` in `{name}.openai.azure.com`. */
+  resourceName: string;
+
+  /** REST API version, sent as the `api-version` query parameter on every request. */
+  apiVersion: string;
+};
+
+/**
+ * API version proposed when adding an Azure OpenAI model. Azure requires an explicit
+ * `api-version` on every request and offers no "latest"; this is a stable version available on
+ * current deployments, which the add-model form lets the user replace to match theirs.
+ */
+export const DEFAULT_AZURE_OPENAI_API_VERSION = "2024-10-21";
+
+/**
+ * Whether a name may be placed in an Azure OpenAI gateway route's path. Azure allows letters,
+ * digits, hyphens, underscores and dots in resource and deployment names, but percent-encoding
+ * alone would not make one safe here: it leaves "." and ".." intact, and URL normalization
+ * resolves those into an escape from the route the gateway assigned us -- a request that still
+ * carries gateway authorization but reaches another provider's passthrough. Requiring an
+ * alphanumeric first character rules those out.
+ */
+export function isValidAzureOpenAiName(name: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name);
+}
 
 /**
  * Workers AI adds the response cap to the prompt and rejects a request whose total exceeds the
@@ -1208,6 +1248,10 @@ export const SUGGESTED_MODELS: Record<
     "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
   },
   "ollama": {
+  },
+  // Azure OpenAI names deployments, not models: a deployment id is chosen by whoever created it,
+  // so there is nothing to suggest. Every Azure model is added by naming its deployment.
+  "azure-openai": {
   },
 };
 

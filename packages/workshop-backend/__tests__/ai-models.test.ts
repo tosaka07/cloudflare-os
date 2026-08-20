@@ -32,6 +32,13 @@ const WORKERS_AI_CONFIG: AiModelConfig = {
   apiToken: "ignored-in-gateway-mode",
 };
 
+const AZURE_CONFIG: AiModelConfig = {
+  provider: "azure-openai",
+  model: "gpt-4.1-deployment",
+  apiToken: "ignored-in-gateway-mode",
+  azure: { resourceName: "my-resource", apiVersion: "2024-10-21" },
+};
+
 function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
   return {
     CF_AI_GATEWAY: "platform-gateway",
@@ -203,6 +210,95 @@ describe("getModel AI Gateway routing", () => {
     expect(request.headers.get("x-api-key")).toBeNull();
     expect(request.headers.get("authorization")).toBeNull();
   }, 15000);
+
+  it("addresses an Azure deployment through the gateway's azure-openai route", async () => {
+    const handle = getModel(
+        env({ CF_AI_GATEWAY_PROVIDERS: "anthropic,azure-openai" }), AZURE_CONFIG, INITIATOR);
+
+    // Azure speaks chat completions here, not the Responses API the direct openai provider
+    // uses: the gateway's azure-openai route names the resource and deployment in its path,
+    // and pi appends /chat/completions to that base.
+    expect(handle.model.api).toBe("openai-completions");
+    expect(handle.model.baseUrl).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/" +
+        "azure-openai/my-resource/gpt-4.1-deployment");
+    expect(handle.aiGatewayLogRoute).toEqual({
+      gateway: "platform-gateway",
+      accountId: "gateway-account-id",
+      apiToken: "gateway-token",
+    });
+
+    const request = await captureRequest(handle);
+    // The Azure key belongs to the gateway, so the request carries gateway auth and nothing
+    // else -- an api-key or Authorization header would be forwarded to Azure as a
+    // request-supplied provider key, overriding the stored one.
+    expect(request.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
+    expect(request.headers.get("authorization")).toBeNull();
+    expect(request.headers.get("api-key")).toBeNull();
+    // The url is not asserted here: a per-call fetch replaces the handle's own transport, which
+    // is what appends `api-version`. The binding suite covers that.
+  }, 15000);
+
+  it("rejects an Azure config that names no resource or API version", () => {
+    expect(() => getModel(
+        env({ CF_AI_GATEWAY_PROVIDERS: "azure-openai" }),
+        { provider: "azure-openai", model: "gpt-4.1-deployment", apiToken: "" },
+        INITIATOR)).toThrow("missing its resource name or API version");
+  });
+
+  it("refuses Azure on a connected user's own Gateway", () => {
+    // Unified billing resells Cloudflare's own providers; a user's gateway holds no Azure key.
+    expect(() => getModel(env(), AZURE_CONFIG, INITIATOR, {
+      userGateway: { accountId: "user-account-id", apiKey: "user-gateway-token" },
+    })).toThrow('Provider "azure-openai" is not supported via unified billing.');
+  });
+
+  it("appends api-version on the HTTPS transport", async () => {
+    // The handle's own transport is what adds the parameter, and a per-call fetch would replace
+    // it, so this drives the real dispatch path with globalThis.fetch stubbed instead. The stub
+    // must be in place before getModel(), which resolves the transport it wraps.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetchStub;
+    try {
+      const handle = getModel(
+          env({ CF_AI_GATEWAY_PROVIDERS: "azure-openai" }), AZURE_CONFIG, INITIATOR);
+      const stream = handle.stream(handle.model, {
+        messages: [{ role: "user", content: "hello", timestamp: 0 }],
+      }, { maxRetries: 0 });
+      expect((await stream.result()).stopReason).toBe("error");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(capturedRequests[0].url).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/" +
+        "azure-openai/my-resource/gpt-4.1-deployment/chat/completions?api-version=2024-10-21");
+  }, 15000);
+
+  it("rejects Azure names that could escape the gateway route", () => {
+    // ".." survives percent-encoding, and the SDK's URL normalization would resolve it away --
+    // sending a request that still carries gateway authorization to another provider's route.
+    expect(() => getModel(env({ CF_AI_GATEWAY_PROVIDERS: "azure-openai" }), {
+      ...AZURE_CONFIG,
+      azure: { resourceName: "..", apiVersion: "2024-10-21" },
+    }, INITIATOR)).toThrow("may contain only letters");
+    expect(() => getModel(env({ CF_AI_GATEWAY_PROVIDERS: "azure-openai" }), {
+      ...AZURE_CONFIG,
+      model: "../openai",
+    }, INITIATOR)).toThrow("may contain only letters");
+  });
+
+  it("always takes max_completion_tokens, whatever the deployment is called", () => {
+    // Azure's newer models reject max_tokens, and a deployment name says nothing about the model
+    // behind it -- "gpt-5.6-luna" happens to match a catalog entry, "prod-chat" matches nothing,
+    // and both may well be reasoning models.
+    for (const model of ["gpt-5.6-luna", "prod-chat"]) {
+      const handle = getModel(
+          env({ CF_AI_GATEWAY_PROVIDERS: "azure-openai" }), { ...AZURE_CONFIG, model }, INITIATOR);
+      expect((handle.model.compat as { maxTokensField?: string }).maxTokensField)
+          .toBe("max_completion_tokens");
+    }
+  });
 
   it("routes Workers AI through the platform gateway like every other provider", async () => {
     const handle = getModel(env(), WORKERS_AI_CONFIG, INITIATOR,
@@ -379,6 +475,43 @@ describe("getModel AI Gateway binding transport", () => {
     expect(entry.headers["cf-aig-authorization"]).toBe("Bearer cloudflare-gateway-binding");
   }, 15000);
 
+  it("carries Azure's api-version on the transport", async () => {
+    const handle = getModel(
+        bindingEnv({ CF_AI_GATEWAY_PROVIDERS: "anthropic,azure-openai" }), AZURE_CONFIG,
+        INITIATOR);
+
+    expect(handle.model.baseUrl).toBe(
+        "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/" +
+        "azure-openai/my-resource/gpt-4.1-deployment");
+
+    const entry = await captureEntry(handle);
+    // pi appends the endpoint path to the model's baseUrl and hands the SDK no defaultQuery, so
+    // the `api-version` Azure requires on every request rides the handle's transport instead --
+    // wrapped around the binding's fetch here.
+    expect(entry.url).toBe(
+        "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/" +
+        "azure-openai/my-resource/gpt-4.1-deployment/chat/completions?api-version=2024-10-21");
+    expect((JSON.parse(entry.body) as { model: string }).model).toBe("gpt-4.1-deployment");
+    const headerNames = Object.keys(entry.headers).map((name) => name.toLowerCase());
+    expect(headerNames).not.toContain("authorization");
+    expect(headerNames).not.toContain("api-key");
+  }, 15000);
+
+  it("sends the token cap to Azure as max_completion_tokens", async () => {
+    // What matters is the field that reaches the wire, not just the descriptor's compat flag:
+    // Azure answers max_tokens with "Unsupported parameter" on its newer models.
+    const handle = getModel(
+        bindingEnv({ CF_AI_GATEWAY_PROVIDERS: "azure-openai" }), AZURE_CONFIG, INITIATOR);
+    const stream = handle.stream(handle.model, {
+      messages: [{ role: "user", content: "hello", timestamp: 0 }],
+    }, { maxRetries: 0, maxTokens: 256 });
+    expect((await stream.result()).stopReason).toBe("error");
+
+    const body = JSON.parse(capturedEntries[0].body) as Record<string, unknown>;
+    expect(body.max_completion_tokens).toBe(256);
+    expect(body.max_tokens).toBeUndefined();
+  }, 15000);
+
   it("requires the token when google is an enabled provider", () => {
     expect(() => getModel(
         bindingEnv({ CF_AI_GATEWAY_PROVIDERS: "anthropic,google" }),
@@ -447,6 +580,12 @@ describe("getModel direct routing (no gateway)", () => {
     expect(() => getModel(env({ CF_AI_GATEWAY: undefined }),
         { ...WORKERS_AI_CONFIG, ...overrides }, INITIATOR))
         .toThrow("This Workers AI model has no Cloudflare credentials.");
+  });
+
+  it("refuses Azure outside gateway mode", () => {
+    // The config carries no Azure credential by design: the gateway holds it.
+    expect(() => getModel(env({ CF_AI_GATEWAY: undefined }), AZURE_CONFIG, INITIATOR))
+        .toThrow("Azure OpenAI models require AI Gateway mode");
   });
 
   it("appends /v1 to an Ollama server base URL", () => {

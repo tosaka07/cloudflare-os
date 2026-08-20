@@ -15,8 +15,8 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
-import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
-  from "@gadgets/workshop-shared/api";
+import { AiChatAuthorInfo, AiModelConfig, isValidAzureOpenAiName, SUGGESTED_MODELS,
+  WORKERS_AI_OUTPUT_LIMIT } from "@gadgets/workshop-shared/api";
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
@@ -134,6 +134,12 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
     case "ollama": return undefined;
+    // Azure serves OpenAI's models and a deployment is conventionally named after the model it
+    // hosts, so OpenAI's catalog supplies the window and cost whenever the deployment name
+    // matches one. A deployment named anything else falls back to the generic defaults. Its
+    // `compat` is not borrowed -- that catalog describes the Responses API, and we speak chat
+    // completions (see gatewayNativeModel).
+    case "azure-openai": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
     default: return undefined;
   }
 }
@@ -227,6 +233,65 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         ...window,
         thinkingLevelMap: catalog?.thinkingLevelMap,
       };
+    case "azure-openai": {
+      const azure = config.azure;
+      if (!azure?.resourceName || !azure.apiVersion) {
+        throw new Error(
+            "This Azure OpenAI model is missing its resource name or API version. Re-add the " +
+            "model with both.");
+      }
+      // Both land in the gateway route's path, so they are checked rather than merely encoded:
+      // percent-encoding leaves ".." intact, and the SDK's URL normalization would resolve it
+      // into a request that escapes the azure-openai route while still carrying this
+      // deployment's gateway authorization.
+      if (!isValidAzureOpenAiName(azure.resourceName) || !isValidAzureOpenAiName(config.model)) {
+        throw new Error(
+            "Azure OpenAI resource and deployment names may contain only letters, digits, " +
+            "dots, hyphens and underscores, and must start with a letter or digit.");
+      }
+      // Azure's deployment-scoped chat completions endpoint, exposed through the gateway's
+      // azure-openai route: that route names the resource and deployment in its path, and pi's
+      // openai-completions impl appends /chat/completions to the base. The `api-version` query
+      // parameter Azure requires on every request is added by the transport instead (see
+      // withAzureApiVersion), because pi passes no defaultQuery to the SDK. We speak chat
+      // completions rather than the Responses API because that is the surface this gateway
+      // route exposes; pi's own azure-openai-responses impl would not serve either way, since
+      // it requires an API key and does not recognize cf-aig-authorization, so it could never
+      // use the gateway's stored Azure key.
+      return {
+        id: config.model,
+        name: catalog?.name ?? config.model,
+        api: "openai-completions",
+        provider: "azure-openai",
+        baseUrl: `${gatewayUrl}/azure-openai/${encodeURIComponent(azure.resourceName)}` +
+            `/${encodeURIComponent(config.model)}`,
+        reasoning: catalog?.reasoning ?? false,
+        input: catalog?.input ?? ["text", "image"],
+        cost: catalog?.cost ?? ZERO_COST,
+        ...window,
+        // Pinned rather than left to pi's baseUrl sniffing, which recognizes the HTTPS gateway
+        // host but not the binding's -- left to itself it would have the two transports disagree
+        // on the token field and on the `developer` role, which Azure's older API versions
+        // reject.
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          // Left off deliberately: with it on, pi sends thinkingLevelMap.off as reasoning_effort
+          // for a model it believes reasons. Azure's docs warn that gpt-5.6 rejects function
+          // tools unless reasoning_effort is "none", but that was measured not to hold on this
+          // route -- a gpt-5.6-luna deployment returns tool_calls with no reasoning_effort sent
+          // at all, even under tool_choice: required. So the deployment keeps its own default
+          // effort instead of trading reasoning away to call tools.
+          supportsReasoningEffort: false,
+          // Not conditional, because a deployment name reveals nothing about the model behind
+          // it: Azure's newer models reject max_tokens outright ("Unsupported parameter:
+          // 'max_tokens' is not supported with this model. Use 'max_completion_tokens'
+          // instead."), and max_completion_tokens is accepted across the board from api-version
+          // 2024-10-21 on -- the version this deployment's form proposes.
+          maxTokensField: "max_completion_tokens",
+        },
+      };
+    }
     case "cloudflare":
       // Workers AI's own OpenAI-compatible endpoint, exposed through the gateway's workers-ai
       // route. This is Workers AI's native chat API (the same surface as its direct
@@ -389,6 +454,12 @@ function getModelViaUserGateway(
   // Cloudflare token via `cf-aig-authorization` (authorized by its `aig.run` scope); the
   // account-level `/ai/v1` REST endpoint rejects that token. We always use the account's
   // auto-created "default" gateway.
+  // Unified billing covers the providers Cloudflare itself resells. Azure inference is paid to
+  // Azure against a key stored on the *platform's* gateway, which a user's own gateway does not
+  // have -- so refuse here rather than send a request that gateway cannot authenticate.
+  if (config.provider === "azure-openai") {
+    throw new Error(`Provider "azure-openai" is not supported via unified billing.`);
+  }
   const model = gatewayNativeModel(
       config, `https://gateway.ai.cloudflare.com/v1/${userGateway.accountId}/default`);
   if (!model) {
@@ -437,6 +508,28 @@ function bindingFetch(binding: Ai): FetchFunction {
   return (input, init) => (binding as unknown as AiFetchBinding).fetch(input, init);
 }
 
+/**
+ * Adds the `api-version` query parameter Azure requires on every request, wrapping whatever
+ * transport the route already uses (the binding's fetch, when the binding carries gateway
+ * traffic). It rides the transport rather than the model's baseUrl because pi appends its
+ * endpoint path to that base -- a query string there would land before /chat/completions -- and
+ * pi hands the SDK no defaultQuery to put it in. Returns `inner` unchanged for every other
+ * provider.
+ */
+function withAzureApiVersion(config: AiModelConfig, inner: FetchFunction | undefined)
+    : FetchFunction | undefined {
+  if (config.provider !== "azure-openai" || !config.azure) return inner;
+  const apiVersion = config.azure.apiVersion;
+  const transport = inner ?? fetch;
+  return (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input.toString());
+    url.searchParams.set("api-version", apiVersion);
+    return input instanceof Request
+        ? transport(new Request(url, input), init)
+        : transport(url, init);
+  };
+}
+
 // Platform free-tier path: route through the deployment's configured AI Gateway (platform-funded).
 // Used only for requests that are NOT billed to a connected user's account.
 function getModelViaGateway(
@@ -479,6 +572,10 @@ function getModelViaGateway(
   const gatewayUrl = binding
       ? `https://workers-binding.ai/ai-gateway/gateways/${gateway}`
       : `${gatewayBase}/${gateway}`;
+  // Azure alone needs its transport wrapped, to carry `api-version`; everyone else gets the
+  // binding's fetch when the binding is the transport, or pi's own fetch when it isn't.
+  const transportFetch =
+      withAzureApiVersion(config, binding ? bindingFetch(binding) : undefined);
   const model = gatewayNativeModel(config, gatewayUrl);
   if (!model) {
     throw new Error(
@@ -497,7 +594,7 @@ function getModelViaGateway(
     // the gateway recognizes its own token there and applies the stored Google key instead.
     ...(config.provider === "google" ? { apiKey: gwConfig.apiToken } : {}),
     headers: gatewayAuthHeaders,
-    ...(binding ? { fetch: bindingFetch(binding) } : {}),
+    ...(transportFetch ? { fetch: transportFetch } : {}),
     gatewayMetadata: metadata,
     sessionAffinity: options.sessionAffinity,
     aiGatewayLogRoute: logRoute(gateway),
@@ -639,6 +736,13 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         apiKey: config.apiToken,
         sessionAffinity,
       });
+    case "azure-openai":
+      // Reachable only through an AI Gateway, which holds the Azure API key: the model config
+      // deliberately carries no credential of its own, so there is nothing to authenticate with
+      // here.
+      throw new Error(
+          "Azure OpenAI models require AI Gateway mode, which this deployment does not have " +
+          "configured (CF_AI_GATEWAY).");
     default:
       config.provider satisfies never;
       throw new Error(`Unknown provider "${config.provider}".`);
