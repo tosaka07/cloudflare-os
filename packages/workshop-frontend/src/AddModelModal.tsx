@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Dialog, Button, Input, Select, SensitiveInput, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
-import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
+import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS,
+  DEFAULT_AZURE_OPENAI_API_VERSION, isValidAzureOpenAiName } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 
@@ -22,6 +23,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
   ollama: 'Ollama',
+  'azure-openai': 'Azure OpenAI',
 }
 
 // Placeholder hinting at the shape of each provider's API token.
@@ -31,16 +33,25 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   google: 'AIza...',
   cloudflare: 'Cloudflare API token',
   ollama: '(optional)',
+  // Never shown: Azure OpenAI is offered only in gateway mode, which hides the token field.
+  'azure-openai': '(stored on the AI Gateway)',
 }
 
-// Example used in the custom-model placeholders for providers that have no suggested models
-// (currently Ollama, which serves whatever the user has pulled locally).
+// Examples used in the custom-model placeholders for providers that have no suggested models:
+// Ollama serves whatever the user has pulled locally, and Azure names deployments the user
+// created (conventionally after the model each hosts).
 const FALLBACK_EXAMPLE_MODEL = { modelId: 'gemma4:31b', name: 'Gemma 4 31B' }
+const AZURE_EXAMPLE_MODEL = { modelId: 'gpt-4.1', name: 'GPT-4.1 (Azure)' }
+
+// Both names go into the gateway route's path, where the backend holds them to the same rule.
+const AZURE_NAME_ERROR =
+  'Use only letters, digits, dots, hyphens and underscores, starting with a letter or digit'
 
 // Pick an example model to show in the custom-model placeholders for the given provider.
 function exampleModel(provider: AiModelProvider): { modelId: string, name: string } {
   const first = Object.entries(SUGGESTED_MODELS[provider])[0]
-  return first ? { modelId: first[0], name: first[1].name } : FALLBACK_EXAMPLE_MODEL
+  if (first) return { modelId: first[0], name: first[1].name }
+  return provider === 'azure-openai' ? AZURE_EXAMPLE_MODEL : FALLBACK_EXAMPLE_MODEL
 }
 
 // Encode a selection into a string value for the Select component.
@@ -67,6 +78,9 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
 
   for (const provider of providerOrder) {
     if (enabledProviders && !enabledProviders.has(provider)) continue
+    // Azure OpenAI authenticates with a key held by the AI Gateway, so there is nothing it can
+    // offer a deployment that isn't in gateway mode.
+    if (!gatewayMode && provider === 'azure-openai') continue
 
     // In gateway mode, suggested models are already built-in, so don't list them.
     if (!gatewayMode) {
@@ -102,6 +116,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const [apiToken, setApiToken] = useState('')
   const [accountId, setAccountId] = useState('')
   const [apiUrl, setApiUrl] = useState('')
+  const [azureResourceName, setAzureResourceName] = useState('')
+  const [azureApiVersion, setAzureApiVersion] = useState('')
 
   // Validation errors
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -124,6 +140,8 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       setApiToken('')
       setAccountId('')
       setApiUrl('')
+      setAzureResourceName('')
+      setAzureApiVersion('')
       setErrors({})
       setAdvancedOpen(false)
     }
@@ -145,6 +163,9 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     setApiToken('')
     setAccountId('')
     setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434' : '')
+    setAzureResourceName('')
+    setAzureApiVersion(
+      sel.provider === 'azure-openai' ? DEFAULT_AZURE_OPENAI_API_VERSION : '')
   }
 
   const validate = (): boolean => {
@@ -156,12 +177,26 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
     if (selection?.type === 'custom') {
       if (!modelId.trim()) newErrors.modelId = 'Please enter the model ID'
+      else if (selection.provider === 'azure-openai' && !isValidAzureOpenAiName(modelId.trim())) {
+        newErrors.modelId = AZURE_NAME_ERROR
+      }
       if (!displayName.trim()) newErrors.displayName = 'Please enter a display name'
     }
 
     const isOllama = selection?.provider === 'ollama'
     const isCloudflare = selection?.provider === 'cloudflare'
     const showCredentials = !gatewayMode
+
+    // Asked for in every mode, unlike the credential fields: they address the deployment, not
+    // authenticate to it.
+    if (selection?.provider === 'azure-openai') {
+      if (!azureResourceName.trim()) {
+        newErrors.azureResourceName = 'Please enter the Azure resource name'
+      } else if (!isValidAzureOpenAiName(azureResourceName.trim())) {
+        newErrors.azureResourceName = AZURE_NAME_ERROR
+      }
+      if (!azureApiVersion.trim()) newErrors.azureApiVersion = 'Please enter the API version'
+    }
 
     if (showCredentials && selection && !isOllama && !apiToken.trim()) {
       newErrors.apiToken = 'Please enter your API token'
@@ -200,6 +235,12 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
         apiToken: gatewayMode ? '' : apiToken.trim(),
         ...(!gatewayMode && accountId.trim() && { accountId: accountId.trim() }),
         ...(!gatewayMode && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
+        ...(selection!.provider === 'azure-openai' && {
+          azure: {
+            resourceName: azureResourceName.trim(),
+            apiVersion: azureApiVersion.trim(),
+          },
+        }),
       }
 
       await authenticatedApi.addModel(profile, config)
@@ -218,6 +259,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const example = selection ? exampleModel(selection.provider) : null
   const isOllama = selection?.provider === 'ollama'
   const isCloudflare = selection?.provider === 'cloudflare'
+  const isAzure = selection?.provider === 'azure-openai'
   const showCredentials = !gatewayMode
 
   // Group options by provider for rendering with visual separators.
@@ -273,9 +315,11 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
           {showCustomFields && (
             <>
               <Input
-                label="Model ID"
+                label={isAzure ? 'Deployment Name' : 'Model ID'}
                 placeholder={`e.g., ${example!.modelId}`}
-                description={`The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
+                description={isAzure
+                  ? `The name of the deployment in your Azure resource (e.g., '${example!.modelId}')`
+                  : `The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
                 value={modelId}
                 onChange={(e) => { setModelId(e.target.value); setErrors(prev => ({ ...prev, modelId: '' })) }}
                 error={errors.modelId}
@@ -290,6 +334,34 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
                 onChange={(e) => { setDisplayName(e.target.value); setErrors(prev => ({ ...prev, displayName: '' })) }}
                 error={errors.displayName}
                 variant={errors.displayName ? 'error' : 'default'}
+              />
+            </>
+          )}
+
+          {/* Azure deployment coordinates. Shown in gateway mode too, unlike the credential
+              fields below: the gateway route names the resource and deployment in its path, and
+              Azure demands an api-version on every request. The API key is not among them -- the
+              gateway holds it. */}
+          {isAzure && (
+            <>
+              <Input
+                label="Azure Resource Name"
+                placeholder="e.g., my-openai-resource"
+                description="The '{name}' part of {name}.openai.azure.com"
+                value={azureResourceName}
+                onChange={(e) => { setAzureResourceName(e.target.value); setErrors(prev => ({ ...prev, azureResourceName: '' })) }}
+                error={errors.azureResourceName}
+                variant={errors.azureResourceName ? 'error' : 'default'}
+              />
+
+              <Input
+                label="API Version"
+                placeholder={DEFAULT_AZURE_OPENAI_API_VERSION}
+                description="Sent on every request. Use 2024-10-21 or later: requests carry max_completion_tokens, which earlier versions reject"
+                value={azureApiVersion}
+                onChange={(e) => { setAzureApiVersion(e.target.value); setErrors(prev => ({ ...prev, azureApiVersion: '' })) }}
+                error={errors.azureApiVersion}
+                variant={errors.azureApiVersion ? 'error' : 'default'}
               />
             </>
           )}
