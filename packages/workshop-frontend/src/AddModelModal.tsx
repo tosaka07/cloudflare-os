@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { Dialog, Button, Input, Select, SensitiveInput, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
 import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS,
-  DEFAULT_AZURE_OPENAI_API_VERSION, isValidAzureOpenAiName } from '@gadgets/workshop-shared/api'
+  GATEWAY_CUSTOM_PRESETS, GatewayCustomApi, GatewayCustomReasoningEffort,
+  isValidGatewayCustomPathPrefix, isValidGatewayCustomSlug } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 
@@ -23,7 +24,7 @@ const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
   ollama: 'Ollama',
-  'azure-openai': 'Azure OpenAI',
+  'gateway-custom': 'Custom Provider',
 }
 
 // Placeholder hinting at the shape of each provider's API token.
@@ -33,25 +34,35 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   google: 'AIza...',
   cloudflare: 'Cloudflare API token',
   ollama: '(optional)',
-  // Never shown: Azure OpenAI is offered only in gateway mode, which hides the token field.
-  'azure-openai': '(stored on the AI Gateway)',
+  // Never shown: a Custom Provider is offered only in gateway mode, which hides the token field.
+  'gateway-custom': '(stored on the AI Gateway)',
 }
 
-// Examples used in the custom-model placeholders for providers that have no suggested models:
-// Ollama serves whatever the user has pulled locally, and Azure names deployments the user
-// created (conventionally after the model each hosts).
+// Example used in the custom-model placeholders for providers that have no suggested models
+// (Ollama serves whatever the user has pulled locally).
 const FALLBACK_EXAMPLE_MODEL = { modelId: 'gemma4:31b', name: 'Gemma 4 31B' }
-const AZURE_EXAMPLE_MODEL = { modelId: 'gpt-4.1', name: 'GPT-4.1 (Azure)' }
 
-// Both names go into the gateway route's path, where the backend holds them to the same rule.
-const AZURE_NAME_ERROR =
-  'Use only letters, digits, dots, hyphens and underscores, starting with a letter or digit'
+// Chosen in the endpoint picker to type an endpoint the presets don't cover.
+const PRESET_MANUAL = '__manual__'
+
+// The slug and the path both land in the gateway route, where the backend holds them to the
+// same rule, so the wording matches what it would reject.
+const SLUG_ERROR = 'Use only letters, digits and hyphens, starting with a letter or digit'
+const PATH_ERROR = 'Start each segment with a letter or digit, e.g. /openai/v1'
+
+const WIRE_FORMATS: { value: GatewayCustomApi, label: string }[] = [
+  { value: 'openai-responses', label: 'OpenAI Responses' },
+  { value: 'openai-completions', label: 'OpenAI Chat Completions' },
+  { value: 'anthropic-messages', label: 'Anthropic Messages' },
+]
+
+const REASONING_EFFORTS: GatewayCustomReasoningEffort[] =
+  ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 
 // Pick an example model to show in the custom-model placeholders for the given provider.
 function exampleModel(provider: AiModelProvider): { modelId: string, name: string } {
   const first = Object.entries(SUGGESTED_MODELS[provider])[0]
-  if (first) return { modelId: first[0], name: first[1].name }
-  return provider === 'azure-openai' ? AZURE_EXAMPLE_MODEL : FALLBACK_EXAMPLE_MODEL
+  return first ? { modelId: first[0], name: first[1].name } : FALLBACK_EXAMPLE_MODEL
 }
 
 // Encode a selection into a string value for the Select component.
@@ -78,9 +89,9 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
 
   for (const provider of providerOrder) {
     if (enabledProviders && !enabledProviders.has(provider)) continue
-    // Azure OpenAI authenticates with a key held by the AI Gateway, so there is nothing it can
-    // offer a deployment that isn't in gateway mode.
-    if (!gatewayMode && provider === 'azure-openai') continue
+    // A Custom Provider is registered on a gateway, which also holds the vendor's key, so it has
+    // nothing to offer a deployment that isn't in gateway mode.
+    if (!gatewayMode && provider === 'gateway-custom') continue
 
     // In gateway mode, suggested models are already built-in, so don't list them.
     if (!gatewayMode) {
@@ -116,8 +127,16 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const [apiToken, setApiToken] = useState('')
   const [accountId, setAccountId] = useState('')
   const [apiUrl, setApiUrl] = useState('')
-  const [azureResourceName, setAzureResourceName] = useState('')
-  const [azureApiVersion, setAzureApiVersion] = useState('')
+  // Custom Provider route. `preset` only seeds the two fields below it; what gets saved is
+  // always the path and format, so a preset can change without stranding saved models.
+  const [preset, setPreset] = useState<string>(PRESET_MANUAL)
+  const [slug, setSlug] = useState('')
+  const [pathPrefix, setPathPrefix] = useState('')
+  const [wireFormat, setWireFormat] = useState<GatewayCustomApi>('openai-responses')
+  const [contextWindow, setContextWindow] = useState('')
+  const [outputLimit, setOutputLimit] = useState('')
+  const [maxTokensField, setMaxTokensField] = useState('')
+  const [reasoningEffort, setReasoningEffort] = useState('')
 
   // Validation errors
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -140,8 +159,14 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       setApiToken('')
       setAccountId('')
       setApiUrl('')
-      setAzureResourceName('')
-      setAzureApiVersion('')
+      setPreset(PRESET_MANUAL)
+      setSlug('')
+      setPathPrefix('')
+      setWireFormat('openai-responses')
+      setContextWindow('')
+      setOutputLimit('')
+      setMaxTokensField('')
+      setReasoningEffort('')
       setErrors({})
       setAdvancedOpen(false)
     }
@@ -163,9 +188,25 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     setApiToken('')
     setAccountId('')
     setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434' : '')
-    setAzureResourceName('')
-    setAzureApiVersion(
-      sel.provider === 'azure-openai' ? DEFAULT_AZURE_OPENAI_API_VERSION : '')
+    setPreset(PRESET_MANUAL)
+    setSlug('')
+    setPathPrefix('')
+    setWireFormat('openai-responses')
+    setContextWindow('')
+    setOutputLimit('')
+    setMaxTokensField('')
+    setReasoningEffort('')
+  }
+
+  // Seed the path and format from a known vendor endpoint. Both stay editable afterwards.
+  const handlePresetSelect = (value: string) => {
+    setPreset(value)
+    setErrors(prev => ({ ...prev, pathPrefix: '', modelId: '' }))
+    const entry = GATEWAY_CUSTOM_PRESETS[value]
+    if (!entry) return
+    setPathPrefix(entry.pathPrefix)
+    setWireFormat(entry.api)
+    setMaxTokensField(entry.maxTokensField ?? '')
   }
 
   const validate = (): boolean => {
@@ -177,9 +218,6 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
     if (selection?.type === 'custom') {
       if (!modelId.trim()) newErrors.modelId = 'Please enter the model ID'
-      else if (selection.provider === 'azure-openai' && !isValidAzureOpenAiName(modelId.trim())) {
-        newErrors.modelId = AZURE_NAME_ERROR
-      }
       if (!displayName.trim()) newErrors.displayName = 'Please enter a display name'
     }
 
@@ -187,15 +225,24 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     const isCloudflare = selection?.provider === 'cloudflare'
     const showCredentials = !gatewayMode
 
-    // Asked for in every mode, unlike the credential fields: they address the deployment, not
-    // authenticate to it.
-    if (selection?.provider === 'azure-openai') {
-      if (!azureResourceName.trim()) {
-        newErrors.azureResourceName = 'Please enter the Azure resource name'
-      } else if (!isValidAzureOpenAiName(azureResourceName.trim())) {
-        newErrors.azureResourceName = AZURE_NAME_ERROR
+    // Asked for in every mode, unlike the credential fields: these address the endpoint rather
+    // than authenticate to it, and the key stays with the gateway either way.
+    if (selection?.provider === 'gateway-custom') {
+      if (!slug.trim()) newErrors.slug = 'Please enter the Custom Provider slug'
+      else if (!isValidGatewayCustomSlug(slug.trim())) newErrors.slug = SLUG_ERROR
+
+      if (!isValidGatewayCustomPathPrefix(pathPrefix.trim())) newErrors.pathPrefix = PATH_ERROR
+
+      const window = Number(contextWindow.trim())
+      if (!contextWindow.trim() || !Number.isInteger(window) || window <= 0) {
+        newErrors.contextWindow = 'Please enter the context window in tokens'
       }
-      if (!azureApiVersion.trim()) newErrors.azureApiVersion = 'Please enter the API version'
+      if (outputLimit.trim()) {
+        const limit = Number(outputLimit.trim())
+        if (!Number.isInteger(limit) || limit <= 0 || limit >= window) {
+          newErrors.outputLimit = 'Must be a positive number below the context window'
+        }
+      }
     }
 
     if (showCredentials && selection && !isOllama && !apiToken.trim()) {
@@ -235,10 +282,19 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
         apiToken: gatewayMode ? '' : apiToken.trim(),
         ...(!gatewayMode && accountId.trim() && { accountId: accountId.trim() }),
         ...(!gatewayMode && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
-        ...(selection!.provider === 'azure-openai' && {
-          azure: {
-            resourceName: azureResourceName.trim(),
-            apiVersion: azureApiVersion.trim(),
+        ...(selection!.provider === 'gateway-custom' && {
+          gatewayCustom: {
+            slug: slug.trim(),
+            pathPrefix: pathPrefix.trim(),
+            api: wireFormat,
+            contextWindow: Number(contextWindow.trim()),
+            ...(outputLimit.trim() && { outputLimit: Number(outputLimit.trim()) }),
+            ...(maxTokensField && {
+              maxTokensField: maxTokensField as 'max_tokens' | 'max_completion_tokens',
+            }),
+            ...(reasoningEffort && {
+              reasoningEffort: reasoningEffort as GatewayCustomReasoningEffort,
+            }),
           },
         }),
       }
@@ -259,7 +315,11 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const example = selection ? exampleModel(selection.provider) : null
   const isOllama = selection?.provider === 'ollama'
   const isCloudflare = selection?.provider === 'cloudflare'
-  const isAzure = selection?.provider === 'azure-openai'
+  const isGatewayCustom = selection?.provider === 'gateway-custom'
+  const presetEntry = GATEWAY_CUSTOM_PRESETS[preset]
+  const modelExample = isGatewayCustom
+    ? (presetEntry?.exampleModel ?? 'model-id')
+    : example?.modelId
   const showCredentials = !gatewayMode
 
   // Group options by provider for rendering with visual separators.
@@ -280,7 +340,9 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
           Add AI Model
         </Dialog.Title>
 
-        <div className="space-y-4">
+        {/* Scrolls on its own so the title and the footer buttons stay put: a Custom Provider
+            route asks for enough fields to outgrow the dialog. */}
+        <div className="space-y-4 max-h-[60vh] overflow-y-auto px-1 -mx-1">
           {/* Model / Provider selection */}
           <Select
             label={gatewayMode ? 'Select Provider' : 'Select Model'}
@@ -315,11 +377,11 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
           {showCustomFields && (
             <>
               <Input
-                label={isAzure ? 'Deployment Name' : 'Model ID'}
-                placeholder={`e.g., ${example!.modelId}`}
-                description={isAzure
-                  ? `The name of the deployment in your Azure resource (e.g., '${example!.modelId}')`
-                  : `The model identifier as specified by the provider (e.g., '${example!.modelId}')`}
+                label="Model ID"
+                placeholder={`e.g., ${modelExample}`}
+                description={isGatewayCustom
+                  ? `The model id the endpoint expects (e.g., '${modelExample}')`
+                  : `The model identifier as specified by the provider (e.g., '${modelExample}')`}
                 value={modelId}
                 onChange={(e) => { setModelId(e.target.value); setErrors(prev => ({ ...prev, modelId: '' })) }}
                 error={errors.modelId}
@@ -338,31 +400,115 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
             </>
           )}
 
-          {/* Azure deployment coordinates. Shown in gateway mode too, unlike the credential
-              fields below: the gateway route names the resource and deployment in its path, and
-              Azure demands an api-version on every request. The API key is not among them -- the
-              gateway holds it. */}
-          {isAzure && (
+          {/* The Custom Provider route. Shown in gateway mode too, unlike the credential fields
+              below: these say which registered provider to address and how to speak to it. The
+              vendor's key is not among them -- the gateway holds it. */}
+          {isGatewayCustom && (
             <>
+              <Select
+                label="Endpoint"
+                className="w-full text-sm"
+                value={preset}
+                onValueChange={(v) => handlePresetSelect(v as string)}
+                renderValue={(v) => v === PRESET_MANUAL
+                  ? 'Other endpoint…'
+                  : (GATEWAY_CUSTOM_PRESETS[v as string]?.label ?? String(v))}
+                description="Fills in the path and wire format below. Both stay editable."
+              >
+                {Object.entries(GATEWAY_CUSTOM_PRESETS).map(([key, entry]) => (
+                  <Select.Option key={key} value={key}>{entry.label}</Select.Option>
+                ))}
+                <Select.Option value={PRESET_MANUAL}>Other endpoint…</Select.Option>
+              </Select>
+
               <Input
-                label="Azure Resource Name"
-                placeholder="e.g., my-openai-resource"
-                description="The '{name}' part of {name}.openai.azure.com"
-                value={azureResourceName}
-                onChange={(e) => { setAzureResourceName(e.target.value); setErrors(prev => ({ ...prev, azureResourceName: '' })) }}
-                error={errors.azureResourceName}
-                variant={errors.azureResourceName ? 'error' : 'default'}
+                label="Custom Provider Slug"
+                placeholder="e.g., azure-sandbox"
+                description={presetEntry
+                  ? `The slug you registered in AI Gateway, whose base URL is ${presetEntry.baseUrlHint}`
+                  : 'The slug you registered under AI Gateway > Custom Providers'}
+                value={slug}
+                onChange={(e) => { setSlug(e.target.value); setErrors(prev => ({ ...prev, slug: '' })) }}
+                error={errors.slug}
+                variant={errors.slug ? 'error' : 'default'}
               />
 
               <Input
-                label="API Version"
-                placeholder={DEFAULT_AZURE_OPENAI_API_VERSION}
-                description="Sent on every request. Use 2024-10-21 or later: requests carry max_completion_tokens, which earlier versions reject"
-                value={azureApiVersion}
-                onChange={(e) => { setAzureApiVersion(e.target.value); setErrors(prev => ({ ...prev, azureApiVersion: '' })) }}
-                error={errors.azureApiVersion}
-                variant={errors.azureApiVersion ? 'error' : 'default'}
+                label="Path"
+                placeholder="/openai/v1"
+                description="Appended to the provider's base URL, before the endpoint itself. Leave empty if the API sits at the root."
+                value={pathPrefix}
+                onChange={(e) => { setPathPrefix(e.target.value); setErrors(prev => ({ ...prev, pathPrefix: '' })) }}
+                error={errors.pathPrefix}
+                variant={errors.pathPrefix ? 'error' : 'default'}
               />
+
+              <Select
+                label="Wire Format"
+                className="w-full text-sm"
+                value={wireFormat}
+                onValueChange={(v) => setWireFormat(v as GatewayCustomApi)}
+                renderValue={(v) => WIRE_FORMATS.find(f => f.value === v)?.label ?? String(v)}
+                description="Which request shape the endpoint speaks"
+              >
+                {WIRE_FORMATS.map(f => (
+                  <Select.Option key={f.value} value={f.value}>{f.label}</Select.Option>
+                ))}
+              </Select>
+
+              <Input
+                label="Context Window"
+                placeholder="e.g., 400000"
+                description="Total tokens one request may occupy. Used to budget context compaction, so an inaccurate value either compacts too early or overflows the model."
+                value={contextWindow}
+                onChange={(e) => { setContextWindow(e.target.value); setErrors(prev => ({ ...prev, contextWindow: '' })) }}
+                error={errors.contextWindow}
+                variant={errors.contextWindow ? 'error' : 'default'}
+              />
+
+              <Collapsible.Root open={advancedOpen} onOpenChange={setAdvancedOpen}>
+                <Collapsible.DefaultTrigger>Advanced Settings</Collapsible.DefaultTrigger>
+                <Collapsible.DefaultPanel>
+                  <div className="space-y-4">
+                    <Input
+                      label="Output Limit"
+                      placeholder="(none)"
+                      description="Tokens reserved out of the context window for the response"
+                      value={outputLimit}
+                      onChange={(e) => { setOutputLimit(e.target.value); setErrors(prev => ({ ...prev, outputLimit: '' })) }}
+                      error={errors.outputLimit}
+                      variant={errors.outputLimit ? 'error' : 'default'}
+                    />
+
+                    <Select
+                      label="Token Cap Field"
+                      className="w-full text-sm"
+                      value={maxTokensField}
+                      onValueChange={(v) => setMaxTokensField(v as string)}
+                      renderValue={(v) => v ? String(v) : 'Default for the format'}
+                      description="Vendors disagree: Azure's newer models reject max_tokens, DeepSeek honours only that one. Ignored by Anthropic Messages."
+                    >
+                      <Select.Option value="">Default for the format</Select.Option>
+                      <Select.Option value="max_completion_tokens">max_completion_tokens</Select.Option>
+                      <Select.Option value="max_tokens">max_tokens</Select.Option>
+                    </Select>
+
+                    <Select
+                      label="Reasoning Effort"
+                      className="w-full text-sm"
+                      value={reasoningEffort}
+                      onValueChange={(v) => setReasoningEffort(v as string)}
+                      renderValue={(v) => v ? String(v) : 'Vendor default'}
+                      description="Sent on every request. Leave at the default unless the model reasons — most models reject the setting. Which values work depends on the model."
+                    >
+                      <Select.Option value="">Vendor default</Select.Option>
+                      {REASONING_EFFORTS.map(e => (
+                        <Select.Option key={e} value={e}>{e}</Select.Option>
+                      ))}
+                    </Select>
+                  </div>
+                </Collapsible.DefaultPanel>
+              </Collapsible.Root>
             </>
           )}
 
