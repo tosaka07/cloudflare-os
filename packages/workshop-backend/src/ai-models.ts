@@ -2,7 +2,8 @@ import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type {
   AnthropicMessagesCompat, Api, AssistantMessageEventStream, Context, FetchFunction, Model,
-  ModelCost, OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
+  ModelCost, OpenAICompletionsCompat, OpenAIResponsesCompat, ProviderHeaders, SimpleStreamOptions,
+  StreamFunction,
 } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
@@ -15,7 +16,8 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
-import { AiChatAuthorInfo, AiModelConfig, isValidAzureOpenAiName, SUGGESTED_MODELS,
+import { AiChatAuthorInfo, AiModelConfig, GatewayCustomReasoningEffort, GatewayCustomRoute,
+  isValidGatewayCustomPathPrefix, isValidGatewayCustomSlug, SUGGESTED_MODELS,
   WORKERS_AI_OUTPUT_LIMIT } from "@gadgets/workshop-shared/api";
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
@@ -134,12 +136,10 @@ function catalogModel(provider: AiModelConfig["provider"], modelId: string): Mod
     case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
     case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
     case "ollama": return undefined;
-    // Azure serves OpenAI's models and a deployment is conventionally named after the model it
-    // hosts, so OpenAI's catalog supplies the window and cost whenever the deployment name
-    // matches one. A deployment named anything else falls back to the generic defaults. Its
-    // `compat` is not borrowed -- that catalog describes the Responses API, and we speak chat
-    // completions (see gatewayNativeModel).
-    case "azure-openai": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
+    // A Custom Provider points at an arbitrary vendor, so a model id here means whatever that
+    // vendor decided; pi's per-provider catalogs cannot be keyed on it. The route carries the
+    // window and cost instead (see GatewayCustomRoute).
+    case "gateway-custom": return undefined;
     default: return undefined;
   }
 }
@@ -168,6 +168,36 @@ function workersAiCompat(catalog: Model<Api> | undefined): OpenAICompletionsComp
     ...(catalog?.compat as OpenAICompletionsCompat | undefined),
     sendSessionAffinityHeaders: true,
   };
+}
+
+/**
+ * Compat flags for a Custom Provider endpoint. Pinned rather than left to pi's baseUrl sniffing,
+ * which recognizes the HTTPS gateway host but not the binding's, so the two transports would
+ * otherwise disagree on what they send. The defaults are the conservative reading of each wire
+ * format; only the token field is left to the route, because vendors genuinely disagree there.
+ */
+function gatewayCustomCompat(route: GatewayCustomRoute)
+    : OpenAICompletionsCompat | OpenAIResponsesCompat | undefined {
+  // A reasoning setting only reaches the wire when the format is told the endpoint accepts one.
+  // Absent leaves it off, which is what keeps a non-reasoning model working.
+  const reasons = route.reasoningEffort !== undefined && route.reasoningEffort !== "off";
+  switch (route.api) {
+    case "openai-completions":
+      return {
+        supportsStore: false,
+        // Most OpenAI-compatible endpoints reject the "developer" role, and several drop the
+        // system prompt in silence rather than erroring on it.
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: reasons,
+        maxTokensField: route.maxTokensField ?? "max_completion_tokens",
+      };
+    case "openai-responses":
+      // Same reasoning as above for the role; the rest of this format's defaults are safe.
+      return { supportsDeveloperRole: false };
+    case "anthropic-messages":
+      // Nothing to pin: this format has no flag the two transports read differently.
+      return undefined;
+  }
 }
 
 // Build the pi model descriptor for reaching a provider's own native API through an AI Gateway
@@ -233,64 +263,42 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         ...window,
         thinkingLevelMap: catalog?.thinkingLevelMap,
       };
-    case "azure-openai": {
-      const azure = config.azure;
-      if (!azure?.resourceName || !azure.apiVersion) {
+    case "gateway-custom": {
+      const route = config.gatewayCustom;
+      if (!route?.slug || !route.contextWindow) {
         throw new Error(
-            "This Azure OpenAI model is missing its resource name or API version. Re-add the " +
-            "model with both.");
+            "This model is missing its Custom Provider slug or context window. Re-add it with " +
+            "both.");
       }
-      // Both land in the gateway route's path, so they are checked rather than merely encoded:
-      // percent-encoding leaves ".." intact, and the SDK's URL normalization would resolve it
-      // into a request that escapes the azure-openai route while still carrying this
-      // deployment's gateway authorization.
-      if (!isValidAzureOpenAiName(azure.resourceName) || !isValidAzureOpenAiName(config.model)) {
+      // Checked rather than merely encoded: percent-encoding leaves ".." intact, and the SDK's
+      // URL normalization would resolve it into a request that escapes the Custom Provider's
+      // route while still carrying this deployment's gateway authorization.
+      if (!isValidGatewayCustomSlug(route.slug) ||
+          !isValidGatewayCustomPathPrefix(route.pathPrefix)) {
         throw new Error(
-            "Azure OpenAI resource and deployment names may contain only letters, digits, " +
-            "dots, hyphens and underscores, and must start with a letter or digit.");
+            "A Custom Provider slug may contain only letters, digits and hyphens, and each path " +
+            "segment must start with a letter or digit.");
       }
-      // Azure's deployment-scoped chat completions endpoint, exposed through the gateway's
-      // azure-openai route: that route names the resource and deployment in its path, and pi's
-      // openai-completions impl appends /chat/completions to the base. The `api-version` query
-      // parameter Azure requires on every request is added by the transport instead (see
-      // withAzureApiVersion), because pi passes no defaultQuery to the SDK. We speak chat
-      // completions rather than the Responses API because that is the surface this gateway
-      // route exposes; pi's own azure-openai-responses impl would not serve either way, since
-      // it requires an API key and does not recognize cf-aig-authorization, so it could never
-      // use the gateway's stored Azure key.
+      // The gateway's Custom Provider passthrough. The vendor's host and API key live on the
+      // provider the slug names, so the request carries no credential of its own -- only the
+      // gateway authorization every route here uses, which each of these three API impls
+      // recognizes. `pathPrefix` sits between that route and whatever endpoint the wire format
+      // appends (/responses, /chat/completions, /v1/messages).
       return {
         id: config.model,
-        name: catalog?.name ?? config.model,
-        api: "openai-completions",
-        provider: "azure-openai",
-        baseUrl: `${gatewayUrl}/azure-openai/${encodeURIComponent(azure.resourceName)}` +
-            `/${encodeURIComponent(config.model)}`,
-        reasoning: catalog?.reasoning ?? false,
-        input: catalog?.input ?? ["text", "image"],
-        cost: catalog?.cost ?? ZERO_COST,
-        ...window,
-        // Pinned rather than left to pi's baseUrl sniffing, which recognizes the HTTPS gateway
-        // host but not the binding's -- left to itself it would have the two transports disagree
-        // on the token field and on the `developer` role, which Azure's older API versions
-        // reject.
-        compat: {
-          supportsStore: false,
-          supportsDeveloperRole: false,
-          // Left off deliberately: with it on, pi sends thinkingLevelMap.off as reasoning_effort
-          // for a model it believes reasons. Azure's docs warn that gpt-5.6 rejects function
-          // tools unless reasoning_effort is "none", but that was measured not to hold on this
-          // route -- a gpt-5.6-luna deployment returns tool_calls with no reasoning_effort sent
-          // at all, even under tool_choice: required. So the deployment keeps its own default
-          // effort instead of trading reasoning away to call tools.
-          supportsReasoningEffort: false,
-          // Not conditional, because a deployment name reveals nothing about the model behind
-          // it: Azure's newer models reject max_tokens outright ("Unsupported parameter:
-          // 'max_tokens' is not supported with this model. Use 'max_completion_tokens'
-          // instead."), and max_completion_tokens is accepted across the board from api-version
-          // 2024-10-21 on -- the version this deployment's form proposes.
-          maxTokensField: "max_completion_tokens",
-        },
-      };
+        name: config.model,
+        api: route.api,
+        provider: "gateway-custom",
+        baseUrl: `${gatewayUrl}/custom-${encodeURIComponent(route.slug)}${route.pathPrefix}`,
+        // The route decides, since nothing else can: a Custom Provider serves whatever vendor it
+        // was registered for, and no catalog is keyed on that vendor's model ids.
+        reasoning: route.reasoningEffort !== undefined && route.reasoningEffort !== "off",
+        input: ["text", "image"],
+        cost: ZERO_COST,
+        contextWindow: route.contextWindow,
+        maxTokens: route.outputLimit ?? 4096,
+        compat: gatewayCustomCompat(route),
+      } as Model<Api>;
     }
     case "cloudflare":
       // Workers AI's own OpenAI-compatible endpoint, exposed through the gateway's workers-ai
@@ -339,7 +347,41 @@ type HandleArgs = {
   // gateway over env.WORKERS_AI.fetch() instead of the global fetch (see bindingFetch).
   // A per-call options.fetch still wins, which tests rely on to capture requests.
   fetch?: FetchFunction;
+  // How hard this model should think, when its configuration says. See reasoningApiExtras.
+  reasoningEffort?: GatewayCustomReasoningEffort;
 };
+
+/**
+ * The per-API options that carry a model's reasoning setting, since each format spells it
+ * differently. `effort` comes from the model's own configuration and is absent for every provider
+ * but gateway-custom, where leaving it absent is what keeps a non-reasoning endpoint working:
+ * a vendor's model id says nothing about whether it reasons, and most reject the setting outright
+ * when it does not.
+ */
+function reasoningApiExtras(model: Model<Api>, effort: GatewayCustomReasoningEffort | undefined)
+    : Record<string, unknown> {
+  switch (model.api) {
+    case "anthropic-messages": {
+      if (effort !== undefined) return { thinkingEnabled: effort !== "off" };
+      // Adaptive thinking (the model decides when and how much to think), but only for models
+      // pi's catalog marks adaptive-capable. Others (e.g. Haiku 4.5) reject that format, so
+      // passing nothing leaves pi to omit `thinking` and the provider default to apply.
+      const anthropicCompat = model.compat as AnthropicMessagesCompat | undefined;
+      return anthropicCompat?.forceAdaptiveThinking === true ? { thinkingEnabled: true } : {};
+    }
+    case "openai-responses":
+      // Passing no effort makes pi *disable* reasoning, which is what "off" asks for. Anything
+      // else keeps the medium default: effort selection is also what makes pi request encrypted
+      // reasoning content, which -- with pi's unconditional `store: false` -- carries reasoning
+      // between tool steps without server-side state.
+      return effort === "off" ? {} : { reasoningEffort: effort ?? "medium" };
+    case "openai-completions":
+      // Only when asked. This format reaches endpoints whose models mostly do not reason at all.
+      return effort !== undefined && effort !== "off" ? { reasoningEffort: effort } : {};
+    default:
+      return {};
+  }
+}
 
 function makeHandle(args: HandleArgs): ModelHandle {
   const streamFn = API_STREAMS[args.model.api];
@@ -347,22 +389,7 @@ function makeHandle(args: HandleArgs): ModelHandle {
     throw new Error(`Unsupported model API "${args.model.api}".`);
   }
 
-  // Per-API extras:
-  // - Anthropic: adaptive thinking (the model decides when/how much to think)` -- but only for
-  //   models pi's catalog marks adaptive-capable (compat.forceAdaptiveThinking). For other
-  //   Anthropic models (e.g. Haiku 4.5, which rejects the adaptive format) we pass nothing, so pi
-  //   omits the `thinking` field and the provider default (no extended thinking) applies --
-  //   matching the pre-pi quick-model behavior.
-  // - OpenAI Responses: explicit medium reasoning effort. pi would otherwise *disable* reasoning
-  //   when no effort is passed; effort selection also makes pi request encrypted reasoning
-  //   content, which -- with pi's unconditional `store: false` -- preserves the old stateless
-  //   ZDR behavior with reasoning carried between tool steps.
-  // - Everything else: provider defaults.
-  const anthropicCompat = args.model.compat as AnthropicMessagesCompat | undefined;
-  const apiExtras: Record<string, unknown> =
-      args.model.api === "anthropic-messages"
-          ? (anthropicCompat?.forceAdaptiveThinking === true ? { thinkingEnabled: true } : {}) :
-      args.model.api === "openai-responses" ? { reasoningEffort: "medium" } : {};
+  const apiExtras = reasoningApiExtras(args.model, args.reasoningEffort);
 
   const handle: ModelHandle = {
     model: args.model,
@@ -454,11 +481,12 @@ function getModelViaUserGateway(
   // Cloudflare token via `cf-aig-authorization` (authorized by its `aig.run` scope); the
   // account-level `/ai/v1` REST endpoint rejects that token. We always use the account's
   // auto-created "default" gateway.
-  // Unified billing covers the providers Cloudflare itself resells. Azure inference is paid to
-  // Azure against a key stored on the *platform's* gateway, which a user's own gateway does not
-  // have -- so refuse here rather than send a request that gateway cannot authenticate.
-  if (config.provider === "azure-openai") {
-    throw new Error(`Provider "azure-openai" is not supported via unified billing.`);
+  // Unified billing covers the providers Cloudflare itself resells. A Custom Provider is
+  // registered on one specific gateway and paid for directly to its vendor, and a user's own
+  // gateway has neither the registration nor the key -- so refuse rather than send a request
+  // that gateway cannot route.
+  if (config.provider === "gateway-custom") {
+    throw new Error(`Provider "gateway-custom" is not supported via unified billing.`);
   }
   const model = gatewayNativeModel(
       config, `https://gateway.ai.cloudflare.com/v1/${userGateway.accountId}/default`);
@@ -508,28 +536,6 @@ function bindingFetch(binding: Ai): FetchFunction {
   return (input, init) => (binding as unknown as AiFetchBinding).fetch(input, init);
 }
 
-/**
- * Adds the `api-version` query parameter Azure requires on every request, wrapping whatever
- * transport the route already uses (the binding's fetch, when the binding carries gateway
- * traffic). It rides the transport rather than the model's baseUrl because pi appends its
- * endpoint path to that base -- a query string there would land before /chat/completions -- and
- * pi hands the SDK no defaultQuery to put it in. Returns `inner` unchanged for every other
- * provider.
- */
-function withAzureApiVersion(config: AiModelConfig, inner: FetchFunction | undefined)
-    : FetchFunction | undefined {
-  if (config.provider !== "azure-openai" || !config.azure) return inner;
-  const apiVersion = config.azure.apiVersion;
-  const transport = inner ?? fetch;
-  return (input, init) => {
-    const url = new URL(input instanceof Request ? input.url : input.toString());
-    url.searchParams.set("api-version", apiVersion);
-    return input instanceof Request
-        ? transport(new Request(url, input), init)
-        : transport(url, init);
-  };
-}
-
 // Platform free-tier path: route through the deployment's configured AI Gateway (platform-funded).
 // Used only for requests that are NOT billed to a connected user's account.
 function getModelViaGateway(
@@ -572,10 +578,6 @@ function getModelViaGateway(
   const gatewayUrl = binding
       ? `https://workers-binding.ai/ai-gateway/gateways/${gateway}`
       : `${gatewayBase}/${gateway}`;
-  // Azure alone needs its transport wrapped, to carry `api-version`; everyone else gets the
-  // binding's fetch when the binding is the transport, or pi's own fetch when it isn't.
-  const transportFetch =
-      withAzureApiVersion(config, binding ? bindingFetch(binding) : undefined);
   const model = gatewayNativeModel(config, gatewayUrl);
   if (!model) {
     throw new Error(
@@ -594,7 +596,9 @@ function getModelViaGateway(
     // the gateway recognizes its own token there and applies the stored Google key instead.
     ...(config.provider === "google" ? { apiKey: gwConfig.apiToken } : {}),
     headers: gatewayAuthHeaders,
-    ...(transportFetch ? { fetch: transportFetch } : {}),
+    ...(binding ? { fetch: bindingFetch(binding) } : {}),
+    ...(config.gatewayCustom?.reasoningEffort !== undefined
+        ? { reasoningEffort: config.gatewayCustom.reasoningEffort } : {}),
     gatewayMetadata: metadata,
     sessionAffinity: options.sessionAffinity,
     aiGatewayLogRoute: logRoute(gateway),
@@ -736,12 +740,12 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         apiKey: config.apiToken,
         sessionAffinity,
       });
-    case "azure-openai":
-      // Reachable only through an AI Gateway, which holds the Azure API key: the model config
-      // deliberately carries no credential of its own, so there is nothing to authenticate with
-      // here.
+    case "gateway-custom":
+      // Reachable only through the AI Gateway holding the Custom Provider registration and the
+      // vendor's key: the model config deliberately carries no credential of its own, so there
+      // is nothing to authenticate with here.
       throw new Error(
-          "Azure OpenAI models require AI Gateway mode, which this deployment does not have " +
+          "Custom Provider models require AI Gateway mode, which this deployment does not have " +
           "configured (CF_AI_GATEWAY).");
     default:
       config.provider satisfies never;

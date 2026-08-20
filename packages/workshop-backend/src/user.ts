@@ -554,15 +554,20 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     profile.type = "agent";
-    // An Azure deployment name is unique only within its own resource, so -- unlike every other
-    // provider's model id -- it can collide with a global one: a deployment named
-    // "gpt-5.6-luna" would be shadowed by the gateway's built-in model of that name, both in
-    // listModels() and in getChatContext(), which resolves gateway models first. Qualify the
-    // record's id so the two can coexist. The model lists render this id beneath the display
-    // name, so the qualified form is visible to the user -- which is the point: it is what
-    // distinguishes an Azure deployment from the built-in model it shares a name with.
-    if (config.provider === "azure-openai" && config.azure) {
-      profile.id = `azure-openai:${config.azure.resourceName}:${config.model}`;
+    // A Custom Provider's model id means whatever its vendor decided, so -- unlike every other
+    // provider's -- it can collide with a global one: an endpoint serving "gpt-5.6-luna" would be
+    // shadowed by the gateway's built-in model of that name, both in listModels() and in
+    // getChatContext(), which resolves gateway models first. Qualifying the record's id keeps
+    // them apart, and including the wire format and effort lets one endpoint be registered
+    // several ways -- the same model reached over Responses and over Chat Completions, or at two
+    // reasoning strengths. The model lists render this id beneath the display name, so the
+    // qualified form is what tells those entries apart on screen.
+    let route = config.gatewayCustom;
+    if (config.provider === "gateway-custom" && route) {
+      profile.id = [
+        "gateway-custom", route.slug, route.api, config.model,
+        ...(route.reasoningEffort ? [route.reasoningEffort] : []),
+      ].join(":");
     }
     this.storage.aiModels.put({profile, config});
   }

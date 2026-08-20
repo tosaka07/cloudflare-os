@@ -31,15 +31,17 @@ const isTextImageOrPdfMime = (mimeType: string) =>
 // pi-ai encodes only text and image content parts, so text + images are universal. PDFs ride an
 // image part and are bridged to a provider's native document input where one exists: Gemini takes
 // application/pdf inline data as-is, and Anthropic/OpenAI payloads are rewritten in flight (see
-// chat-attachment-pdf.ts). Workers AI, Ollama and Azure OpenAI have no document input at all --
-// all three speak chat completions, which has no content part a PDF could be bridged onto.
+// chat-attachment-pdf.ts). Workers AI and Ollama speak chat completions, which has no content
+// part a PDF could be bridged onto. A Custom Provider may speak any of the three formats, but
+// the bridge keys on the wire format alone and cannot see which one a stored model uses from
+// here, so it takes the same conservative floor.
 const ATTACHMENT_SUPPORT_BY_PROVIDER = {
   anthropic: isTextImageOrPdfMime,
   openai: isTextImageOrPdfMime,
   google: isTextImageOrPdfMime,
   cloudflare: isTextOrImageMime,
   ollama: isTextOrImageMime,
-  "azure-openai": isTextOrImageMime,
+  "gateway-custom": isTextOrImageMime,
 } satisfies Record<AiModelProvider, (mimeType: string) => boolean>;
 
 function sanitizeChatAttachmentMimeType(mimeType: string | undefined): string {
