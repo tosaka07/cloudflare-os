@@ -1134,7 +1134,7 @@ export type CloudflareAccountOption = {
 
 /** Supported AI providers. */
 export type AiModelProvider =
-    "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "azure-openai";
+    "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "gateway-custom";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -1169,43 +1169,153 @@ export type AiModelConfig = {
   apiUrl?: string;
 
   /**
-   * Which Azure OpenAI deployment to reach. Required for provider "azure-openai", whose AI
-   * Gateway route names the resource and deployment in its path; unused for other providers.
+   * How to reach a vendor that AI Gateway serves through a Custom Provider. Required for
+   * provider "gateway-custom"; unused for other providers.
    */
-  azure?: AzureOpenAiDeployment;
+  gatewayCustom?: GatewayCustomRoute;
 };
 
 /**
- * Locates an Azure OpenAI deployment. The deployment name itself is `AiModelConfig.model`, since
- * an Azure request names a deployment where other providers name a model; this carries what the
- * endpoint needs on top of that. Azure OpenAI is reachable only through an AI Gateway, which
- * holds the Azure API key, so no credential appears here.
+ * Reaches a vendor that AI Gateway does not serve natively, through a Custom Provider registered
+ * on the gateway. The vendor's host and API key live there, so this carries only what the
+ * Workshop must decide for itself: which registered provider to address, and how to speak to it.
+ * No credential appears here -- the gateway supplies the vendor's key from its own store.
  */
-export type AzureOpenAiDeployment = {
-  /** Resource name, i.e. the `{name}` in `{name}.openai.azure.com`. */
-  resourceName: string;
+export type GatewayCustomRoute = {
+  /**
+   * The Custom Provider's slug, as registered in the dashboard. It names the `custom-{slug}`
+   * segment of the gateway route, and the provider it names owns the vendor's base URL and key.
+   */
+  slug: string;
 
-  /** REST API version, sent as the `api-version` query parameter on every request. */
-  apiVersion: string;
+  /**
+   * Path between the Custom Provider's base URL and the endpoint the wire format appends, e.g.
+   * "/openai/v1" for an Azure v1 surface or "/apps/anthropic" for Alibaba's Anthropic-compatible
+   * one. Empty when the vendor's API sits at the root. It belongs here rather than in the Custom
+   * Provider's base URL because one registered provider often serves several of these -- Alibaba
+   * offers both of the paths above on one host -- and folding a path into the base URL would mean
+   * a second registration, with the vendor's key stored (and rotated) twice.
+   */
+  pathPrefix: string;
+
+  /** Which wire format the endpoint speaks; selects the API implementation to drive it with. */
+  api: GatewayCustomApi;
+
+  /**
+   * Total tokens one request may occupy. Required rather than inferred: a Custom Provider points
+   * at arbitrary models whose windows range from a few thousand tokens to over a million, and
+   * this feeds the context-compaction budget -- a wrong default either compacts far too early or
+   * overflows the model.
+   */
+  contextWindow: number;
+
+  /**
+   * Tokens reserved out of `contextWindow` for the response. Absent leaves the remainder of the
+   * window to the prompt.
+   */
+  outputLimit?: number;
+
+  /**
+   * Which field carries the response cap on an OpenAI-compatible endpoint. Vendors disagree:
+   * Azure's newer models reject `max_tokens`, while DeepSeek's chat API honours only that one.
+   * Absent picks the default for the wire format. Ignored by "anthropic-messages".
+   */
+  maxTokensField?: "max_tokens" | "max_completion_tokens";
+
+  /**
+   * How hard the model should think, when it supports the notion. Absent leaves the vendor's own
+   * default in place, which is what keeps a non-reasoning model working: a deployment name says
+   * nothing about the model behind it, and sending a reasoning setting to a model without one is
+   * an error at most vendors.
+   */
+  reasoningEffort?: GatewayCustomReasoningEffort;
 };
 
 /**
- * API version proposed when adding an Azure OpenAI model. Azure requires an explicit
- * `api-version` on every request and offers no "latest"; this is a stable version available on
- * current deployments, which the add-model form lets the user replace to match theirs.
+ * Wire formats a Custom Provider endpoint can speak. Each names an API implementation that
+ * recognizes `cf-aig-authorization`, which is what lets the gateway hold the vendor's key.
  */
-export const DEFAULT_AZURE_OPENAI_API_VERSION = "2024-10-21";
+export type GatewayCustomApi = "openai-responses" | "openai-completions" | "anthropic-messages";
+
+/** Reasoning strength for {@link GatewayCustomRoute.reasoningEffort}. "off" disables reasoning. */
+export type GatewayCustomReasoningEffort =
+    "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** A known vendor endpoint, offered in the add-model form so its shape need not be typed by hand. */
+export type GatewayCustomPreset = {
+  /** Shown in the endpoint picker. */
+  label: string;
+  pathPrefix: string;
+  api: GatewayCustomApi;
+  /** What to register as the Custom Provider's base URL, shown as a hint beside the slug field. */
+  baseUrlHint: string;
+  /** Example model id for the placeholder. */
+  exampleModel: string;
+
+  /**
+   * Seeds the token cap field when the vendor is known to want one specific spelling, sparing the
+   * user a setting they would otherwise discover by getting an error back.
+   */
+  maxTokensField?: GatewayCustomRoute["maxTokensField"];
+};
 
 /**
- * Whether a name may be placed in an Azure OpenAI gateway route's path. Azure allows letters,
- * digits, hyphens, underscores and dots in resource and deployment names, but percent-encoding
- * alone would not make one safe here: it leaves "." and ".." intact, and URL normalization
- * resolves those into an escape from the route the gateway assigned us -- a request that still
- * carries gateway authorization but reaches another provider's passthrough. Requiring an
- * alphanumeric first character rules those out.
+ * Vendor endpoints known to work through a Custom Provider. Adding one is a row here: the routing
+ * reads {@link GatewayCustomRoute}, so no provider, wire format or UI branch grows with it. A
+ * vendor serving several formats gets one row each, all sharing a single Custom Provider (and so
+ * a single stored key).
  */
-export function isValidAzureOpenAiName(name: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name);
+export const GATEWAY_CUSTOM_PRESETS: Record<string, GatewayCustomPreset> = {
+  "azure-responses": {
+    label: "Azure OpenAI — Responses API",
+    pathPrefix: "/openai/v1",
+    api: "openai-responses",
+    baseUrlHint: "https://{resource}.openai.azure.com",
+    exampleModel: "gpt-5.6-luna",
+  },
+  "azure-chat": {
+    label: "Azure OpenAI — Chat Completions",
+    pathPrefix: "/openai/v1",
+    api: "openai-completions",
+    baseUrlHint: "https://{resource}.openai.azure.com",
+    exampleModel: "gpt-4.1",
+  },
+  "alibaba-anthropic": {
+    label: "Alibaba Model Studio — Anthropic-compatible",
+    pathPrefix: "/apps/anthropic",
+    api: "anthropic-messages",
+    baseUrlHint: "https://dashscope-us.aliyuncs.com, or your region's host",
+    exampleModel: "qwen3.7-plus",
+  },
+  "alibaba-chat": {
+    label: "Alibaba Model Studio — Chat Completions",
+    pathPrefix: "/compatible-mode/v1",
+    api: "openai-completions",
+    baseUrlHint: "https://dashscope-us.aliyuncs.com, or your region's host",
+    exampleModel: "deepseek-v4-flash",
+    // Measured: this endpoint rejects max_completion_tokens, which is the default for the format.
+    maxTokensField: "max_tokens",
+  },
+};
+
+/**
+ * Whether a Custom Provider slug is safe to place in the gateway route's path. Percent-encoding
+ * alone would not make it safe: it leaves "." and ".." intact, and URL normalization resolves
+ * those into an escape from the route the gateway assigned us -- a request that still carries
+ * gateway authorization but reaches another provider's passthrough. Requiring an alphanumeric
+ * first character rules those out.
+ */
+export function isValidGatewayCustomSlug(slug: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/.test(slug);
+}
+
+/**
+ * Whether a path prefix is safe to append to the gateway route. Empty is allowed (the vendor's
+ * API sits at the root); otherwise every segment must start alphanumeric, which keeps "." and
+ * ".." out for the reason given on {@link isValidGatewayCustomSlug}.
+ */
+export function isValidGatewayCustomPathPrefix(pathPrefix: string): boolean {
+  return pathPrefix === "" || /^(\/[A-Za-z0-9][A-Za-z0-9._-]*)+$/.test(pathPrefix);
 }
 
 /**
@@ -1249,9 +1359,9 @@ export const SUGGESTED_MODELS: Record<
   },
   "ollama": {
   },
-  // Azure OpenAI names deployments, not models: a deployment id is chosen by whoever created it,
-  // so there is nothing to suggest. Every Azure model is added by naming its deployment.
-  "azure-openai": {
+  // A Custom Provider points at whatever vendor the deployment registered, so there is nothing to
+  // suggest. Every such model is added by naming its endpoint and model id.
+  "gateway-custom": {
   },
 };
 
