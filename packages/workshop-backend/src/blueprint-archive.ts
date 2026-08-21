@@ -99,7 +99,11 @@ export async function readBlueprintKvRecord(
   env: BlueprintKvEnv,
   blueprintId: string,
 ): Promise<BlueprintKvRecord | null> {
-  if (isReservedBlueprintKey(blueprintId)) {
+  // An empty id is treated as naming nothing, alongside the reserved keys. It has to be caught
+  // before the lookup: KV rejects an empty key outright ("Key name cannot be empty"), which
+  // surfaces as a runtime error rather than the missing-blueprint case every caller already
+  // handles -- and which an agent reading it cannot act on.
+  if (!blueprintId || isReservedBlueprintKey(blueprintId)) {
     return null;
   }
 
