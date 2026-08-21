@@ -553,6 +553,44 @@ describe("getModel AI Gateway binding transport", () => {
     expect((await drive({ api: "anthropic-messages" })).thinking).toBeUndefined();
   }, 15000);
 
+  it("states tool strictness rather than leaving the vendor to decide", async () => {
+    // Left unstated, pi omits `strict` and a vendor that defaults it on rewrites every optional
+    // parameter into a required one -- Azure does. An agent then cannot omit an optional argument
+    // however it is asked to, and the failure has no recovery. Asserted on the wire for both
+    // formats, since each decides this differently and both read the gateway host as a reason to
+    // stay quiet.
+    const drive = async (api: "openai-responses" | "openai-completions") => {
+      capturedEntries.length = 0;
+      const handle = getModel(bindingEnv({ CF_AI_GATEWAY_PROVIDERS: "gateway-custom" }), {
+        ...CUSTOM_CONFIG,
+        gatewayCustom: { ...CUSTOM_CONFIG.gatewayCustom!, api },
+      }, INITIATOR);
+      const stream = handle.stream(handle.model, {
+        messages: [{ role: "user", content: "hello", timestamp: 0 }],
+        tools: [{
+          name: "createGadget",
+          description: "Create a gadget",
+          parameters: {
+            type: "object",
+            properties: { title: { type: "string" }, blueprintId: { type: "string" } },
+            required: ["title"],
+          },
+        }],
+      } as any, { maxRetries: 0 });
+      expect((await stream.result()).stopReason).toBe("error");
+      return JSON.parse(capturedEntries[0].body) as Record<string, any>;
+    };
+
+    const responses = await drive("openai-responses");
+    expect(responses.tools[0].strict).toBe(false);
+    // The optional parameter stays optional, which is the whole point.
+    expect(responses.tools[0].parameters.required).toEqual(["title"]);
+
+    const completions = await drive("openai-completions");
+    expect(completions.tools[0].function.strict).toBe(false);
+    expect(completions.tools[0].function.parameters.required).toEqual(["title"]);
+  }, 15000);
+
   it("requires the token when google is an enabled provider", () => {
     expect(() => getModel(
         bindingEnv({ CF_AI_GATEWAY_PROVIDERS: "anthropic,google" }),

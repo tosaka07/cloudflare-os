@@ -189,11 +189,22 @@ function gatewayCustomCompat(route: GatewayCustomRoute)
         // system prompt in silence rather than erroring on it.
         supportsDeveloperRole: false,
         supportsReasoningEffort: reasons,
+        // Stated rather than left to pi's baseUrl sniffing, which reads the gateway host as
+        // "Cloudflare AI Gateway" and turns this off -- pi then omits `strict`, and a vendor that
+        // defaults it on rewrites every optional parameter into a required one. See the
+        // openai-responses case for what that costs an agent.
+        supportsStrictMode: true,
         maxTokensField: route.maxTokensField ?? "max_completion_tokens",
       };
     case "openai-responses":
-      // Same reasoning as above for the role; the rest of this format's defaults are safe.
-      return { supportsDeveloperRole: false };
+      // Same reasoning as above for the role. supportsStrictMode is on so that pi *states* the
+      // strictness rather than leaving the field out: this format defaults it off, pi then omits
+      // `strict` entirely, and Azure fills the gap by turning strict on itself -- which rewrites
+      // every optional parameter into a required one. An agent then cannot omit an optional
+      // argument however it is asked to, and has no way to recover. Sending it explicitly (pi
+      // sends `strict: false`, having no constrained-sampling tools to demand otherwise) leaves
+      // the schema as written.
+      return { supportsDeveloperRole: false, supportsStrictMode: true };
     case "anthropic-messages":
       // Nothing to pin: this format has no flag the two transports read differently.
       return undefined;
