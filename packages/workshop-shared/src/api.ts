@@ -1244,19 +1244,27 @@ export type GatewayCustomApi = "openai-responses" | "openai-completions" | "anth
  * nobody can get the window wrong in a way that breaks their own compaction budget.
  */
 export type DeploymentCustomModel = GatewayCustomRoute & {
-  /**
-   * The id this model is offered under, unique across the declaration. It is the vendor's own id
-   * unless {@link model} says otherwise, which is what lets one endpoint appear several times --
-   * the same model at different reasoning strengths, say.
-   */
-  id: string;
-
-  /** The id the vendor knows it by. Absent means {@link id} already is that id. */
-  model?: string;
+  /** The id the vendor knows this model by, sent as the model on every request. */
+  model: string;
 
   /** Display name shown in the model picker. */
   name: string;
 };
+
+/**
+ * The id a gateway-custom model is offered under. Derived rather than chosen, for two reasons: a
+ * vendor's model id can collide with a global one (an endpoint serving "gpt-5.6-luna" would be
+ * shadowed by the built-in of that name), and one endpoint is often offered several ways -- the
+ * same model over two wire formats, or at two reasoning strengths -- which a bare model id cannot
+ * tell apart. Deriving it also means a deployment's declaration and a user's own registration
+ * produce the same id for the same model, instead of two spellings of it.
+ */
+export function gatewayCustomModelId(model: string, route: GatewayCustomRoute): string {
+  return [
+    "gateway-custom", route.slug, route.api, model,
+    ...(route.reasoningEffort ? [route.reasoningEffort] : []),
+  ].join(":");
+}
 
 /** Reasoning strength for {@link GatewayCustomRoute.reasoningEffort}. "off" disables reasoning. */
 export type GatewayCustomReasoningEffort =
