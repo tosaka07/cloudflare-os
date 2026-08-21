@@ -1237,6 +1237,20 @@ export type GatewayCustomRoute = {
  */
 export type GatewayCustomApi = "openai-responses" | "openai-completions" | "anthropic-messages";
 
+/**
+ * A model the deployment offers to every user, declared in CF_AI_GATEWAY_CUSTOM_MODELS rather
+ * than registered per user. The vendor's key is on the gateway and the route holds no secret, so
+ * one declaration serves everyone: nobody has to retype a slug, a path or a context window, and
+ * nobody can get the window wrong in a way that breaks their own compaction budget.
+ */
+export type DeploymentCustomModel = GatewayCustomRoute & {
+  /** The id the vendor knows this model by, and the id it is offered under. */
+  id: string;
+
+  /** Display name shown in the model picker. */
+  name: string;
+};
+
 /** Reasoning strength for {@link GatewayCustomRoute.reasoningEffort}. "off" disables reasoning. */
 export type GatewayCustomReasoningEffort =
     "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

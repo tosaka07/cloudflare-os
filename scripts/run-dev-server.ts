@@ -486,7 +486,7 @@ for (const gk of gatekeepers) {
     // CF_AI_GATEWAY_API_TOKEN over HTTPS. The google provider can't ride the binding and
     // needs the token even when the binding is present.
     "CF_AI_GATEWAY", "CF_AI_GATEWAY_PROVIDERS", "CF_AI_GATEWAY_ACCOUNT_ID",
-    "CF_AI_GATEWAY_API_TOKEN", "CF_AI_GATEWAY_USE_BINDING",
+    "CF_AI_GATEWAY_API_TOKEN", "CF_AI_GATEWAY_USE_BINDING", "CF_AI_GATEWAY_CUSTOM_MODELS",
   ];
   // OAuth app credentials (GOOGLE_/GITHUB_/CLOUDFLARE_OAUTH_*) are NOT passed to the backend anymore;
   // they are injected into the gatekeeper Workers (see SHARED_GATEKEEPER_CREDS below).

@@ -581,6 +581,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
           throw new Error(`Cannot delete built-in model "${models[id].name}".`);
         }
       }
+      let deploymentModel = gwConfig.customModels.get(id);
+      if (deploymentModel) {
+        throw new Error(`Cannot delete built-in model "${deploymentModel.name}".`);
+      }
     }
 
     this.storage.aiModels.delete(id);

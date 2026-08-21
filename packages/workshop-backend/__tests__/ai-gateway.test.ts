@@ -14,6 +14,84 @@ function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
   } as Cloudflare.Env;
 }
 
+describe("AiGatewayConfig deployment models", () => {
+  const MODELS = JSON.stringify([
+    {
+      id: "gpt-5.6-luna", name: "GPT-5.6 Luna (Azure)", contextWindow: 1_050_000,
+      slug: "azure-sandbox", pathPrefix: "/openai/v1", api: "openai-responses",
+    },
+    {
+      id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (Alibaba)", contextWindow: 1_000_000,
+      slug: "alibaba", pathPrefix: "/compatible-mode/v1", api: "openai-completions",
+      maxTokensField: "max_tokens",
+    },
+  ]);
+
+  function customEnv(models: string, providers = "cloudflare,gateway-custom"): Cloudflare.Env {
+    return env({
+      CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+      CF_AI_GATEWAY_API_TOKEN: "gateway-token",
+      CF_AI_GATEWAY_PROVIDERS: providers,
+      CF_AI_GATEWAY_CUSTOM_MODELS: models,
+    });
+  }
+
+  it("offers deployment models to everyone, alongside the suggested ones", () => {
+    const config = new AiGatewayConfig(customEnv(MODELS));
+    const ids = config.getModelList().map(m => m.id);
+    expect(ids).toContain("gpt-5.6-luna");
+    expect(ids).toContain("deepseek-v4-flash");
+    // The suggested catalog still comes through: these are additions, not a replacement.
+    expect(ids.some(id => id.startsWith("@cf/"))).toBe(true);
+  });
+
+  it("resolves one into a route no user had to type", () => {
+    const config = new AiGatewayConfig(customEnv(MODELS));
+    const resolved = config.resolveModel("deepseek-v4-flash");
+    expect(resolved?.profile).toEqual({
+      type: "agent", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (Alibaba)",
+    });
+    expect(resolved?.config.provider).toBe("gateway-custom");
+    expect(resolved?.config.gatewayCustom).toEqual({
+      slug: "alibaba", pathPrefix: "/compatible-mode/v1", api: "openai-completions",
+      contextWindow: 1_000_000, maxTokensField: "max_tokens",
+    });
+    // No credential travels with it; the gateway supplies the vendor's key.
+    expect(resolved?.config.apiToken).toBe("");
+  });
+
+  it("ignores the declaration when the provider is switched off", () => {
+    const config = new AiGatewayConfig(customEnv(MODELS, "cloudflare"));
+    expect(config.customModels.size).toBe(0);
+    expect(config.resolveModel("gpt-5.6-luna")).toBeUndefined();
+  });
+
+  it("refuses a declaration that would fail later", () => {
+    // Each of these would otherwise surface as a model that never appears, or one that 404s at
+    // the vendor once somebody tries to chat with it.
+    const bad: [string, string][] = [
+      ["not json", "not valid JSON"],
+      ['{"id":"x"}', "must be a JSON array"],
+      ['[{"name":"No id","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"}]',
+       "needs both an id and a name"],
+      ['[{"id":"x","name":"X","contextWindow":1,"slug":"..","pathPrefix":"","api":"openai-responses"}]',
+       "needs a slug"],
+      ['[{"id":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"/../b","api":"openai-responses"}]',
+       "needs a pathPrefix"],
+      ['[{"id":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"grpc"}]',
+       "needs an api of"],
+      ['[{"id":"x","name":"X","slug":"a","pathPrefix":"","api":"openai-responses"}]',
+       "positive integer contextWindow"],
+      ['[{"id":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"},' +
+       '{"id":"x","name":"Y","contextWindow":1,"slug":"b","pathPrefix":"","api":"openai-responses"}]',
+       "declared twice"],
+    ];
+    for (const [models, message] of bad) {
+      expect(() => new AiGatewayConfig(customEnv(models))).toThrow(message);
+    }
+  });
+});
+
 describe("AiGatewayConfig transport selection", () => {
   const binding = { gateway: () => ({}) } as unknown as Ai;
   // google needs the HTTPS+token transport, so token-less configs must not enable it.
