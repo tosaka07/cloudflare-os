@@ -2722,8 +2722,11 @@ export async function runAgent(
           }
 
           // Fetch the blueprint (if any) before creating anything, so a bad blueprintId fails
-          // cleanly without leaving an empty gadget behind.
-          let blueprint = blueprintId !== undefined
+          // cleanly without leaving an empty gadget behind. An empty string counts as "none":
+          // the parameter is optional, but a provider that rewrites the schema -- or a model that
+          // fills every field it is shown -- turns an omission into "". There is no recovering
+          // from the error that follows, since a gadget wanting no blueprint has no id to name.
+          let blueprint = blueprintId
               ? await hooks.fetchBlueprint(blueprintId) : undefined;
 
           // Flush edits captured so far into their own "changes" message before creating the
