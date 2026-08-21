@@ -1,6 +1,6 @@
 import {
-  AiChatAuthorInfo, AiModelConfig, DeploymentCustomModel, GatewayCustomApi, HTTPS_ONLY_PROVIDERS,
-  isValidGatewayCustomPathPrefix, isValidGatewayCustomSlug, SUGGESTED_MODELS,
+  AiChatAuthorInfo, AiModelConfig, DeploymentCustomModel, GatewayCustomApi, gatewayCustomModelId,
+  HTTPS_ONLY_PROVIDERS, isValidGatewayCustomPathPrefix, isValidGatewayCustomSlug, SUGGESTED_MODELS,
 } from "@gadgets/workshop-shared/api";
 import { UserAiModelRecord } from "./user.js";
 
@@ -37,11 +37,11 @@ function parseCustomModels(raw: string | undefined): Map<string, DeploymentCusto
   }
 
   for (const entry of parsed as Partial<DeploymentCustomModel>[]) {
-    const where = entry?.id ? `model "${entry.id}"` : "a model";
+    const where = entry?.model ? `model "${entry.model}"` : "a model";
     const fail = (why: string) => {
       throw new Error(`CF_AI_GATEWAY_CUSTOM_MODELS: ${where} ${why}.`);
     };
-    if (!entry?.id || !entry.name) fail("needs both an id and a name");
+    if (!entry?.model || !entry.name) fail("needs both a model and a name");
     if (!entry.slug || !isValidGatewayCustomSlug(entry.slug)) {
       fail("needs a slug of letters, digits and hyphens, starting with a letter or digit");
     }
@@ -54,8 +54,11 @@ function parseCustomModels(raw: string | undefined): Map<string, DeploymentCusto
     if (!Number.isInteger(entry.contextWindow) || entry.contextWindow! <= 0) {
       fail("needs a positive integer contextWindow");
     }
-    if (result.has(entry.id!)) fail("is declared twice");
-    result.set(entry.id!, entry as DeploymentCustomModel);
+    // Keyed on the id it will be offered under, so two entries that differ only in something the
+    // id does not carry are caught here rather than shadowing each other in the picker.
+    const id = gatewayCustomModelId(entry.model!, entry as DeploymentCustomModel);
+    if (result.has(id)) fail("is declared twice");
+    result.set(id, entry as DeploymentCustomModel);
   }
   return result;
 }
@@ -154,8 +157,8 @@ export class AiGatewayConfig {
         }
       }
     }
-    for (let model of this.customModels.values()) {
-      result.push({ type: "agent", id: model.id, name: model.name });
+    for (let [id, model] of this.customModels) {
+      result.push({ type: "agent", id, name: model.name });
     }
     return result;
   }
@@ -167,14 +170,12 @@ export class AiGatewayConfig {
   resolveModel(modelId: string): UserAiModelRecord | undefined {
     let custom = this.customModels.get(modelId);
     if (custom) {
-      const { id, name, model, ...route } = custom;
+      const { name, model, ...route } = custom;
       return {
-        profile: { type: "agent", id, name },
+        profile: { type: "agent", id: modelId, name },
         // apiToken is ignored in AI Gateway mode -- getModel() authenticates with the gateway
         // token and lets the gateway supply the vendor's own key.
-        config: {
-          provider: "gateway-custom", model: model ?? id, apiToken: "", gatewayCustom: route,
-        },
+        config: { provider: "gateway-custom", model, apiToken: "", gatewayCustom: route },
       };
     }
     for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {

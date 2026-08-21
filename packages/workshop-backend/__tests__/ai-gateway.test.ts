@@ -17,11 +17,11 @@ function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
 describe("AiGatewayConfig deployment models", () => {
   const MODELS = JSON.stringify([
     {
-      id: "gpt-5.6-luna", name: "GPT-5.6 Luna (Azure)", contextWindow: 1_050_000,
+      model: "gpt-5.6-luna", name: "GPT-5.6 Luna (Azure)", contextWindow: 1_050_000,
       slug: "azure-sandbox", pathPrefix: "/openai/v1", api: "openai-responses",
     },
     {
-      id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (Alibaba)", contextWindow: 1_000_000,
+      model: "deepseek-v4-flash", name: "DeepSeek V4 Flash (Alibaba)", contextWindow: 1_000_000,
       slug: "alibaba", pathPrefix: "/compatible-mode/v1", api: "openai-completions",
       maxTokensField: "max_tokens",
     },
@@ -39,18 +39,21 @@ describe("AiGatewayConfig deployment models", () => {
   it("offers deployment models to everyone, alongside the suggested ones", () => {
     const config = new AiGatewayConfig(customEnv(MODELS));
     const ids = config.getModelList().map(m => m.id);
-    expect(ids).toContain("gpt-5.6-luna");
-    expect(ids).toContain("deepseek-v4-flash");
+    // Ids are derived, so a vendor's model id cannot shadow a built-in of the same name.
+    expect(ids).toContain("gateway-custom:azure-sandbox:openai-responses:gpt-5.6-luna");
+    expect(ids).toContain("gateway-custom:alibaba:openai-completions:deepseek-v4-flash");
     // The suggested catalog still comes through: these are additions, not a replacement.
     expect(ids.some(id => id.startsWith("@cf/"))).toBe(true);
   });
 
   it("resolves one into a route no user had to type", () => {
     const config = new AiGatewayConfig(customEnv(MODELS));
-    const resolved = config.resolveModel("deepseek-v4-flash");
+    const id = "gateway-custom:alibaba:openai-completions:deepseek-v4-flash";
+    const resolved = config.resolveModel(id);
     expect(resolved?.profile).toEqual({
-      type: "agent", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (Alibaba)",
+      type: "agent", id, name: "DeepSeek V4 Flash (Alibaba)",
     });
+    expect(resolved?.config.model).toBe("deepseek-v4-flash");
     expect(resolved?.config.provider).toBe("gateway-custom");
     expect(resolved?.config.gatewayCustom).toEqual({
       slug: "alibaba", pathPrefix: "/compatible-mode/v1", api: "openai-completions",
@@ -63,21 +66,24 @@ describe("AiGatewayConfig deployment models", () => {
   it("lets one endpoint appear several times, at different strengths", () => {
     const config = new AiGatewayConfig(customEnv(JSON.stringify([
       {
-        id: "luna-high", model: "gpt-5.6-luna", name: "Luna (high)", reasoningEffort: "high",
+        model: "gpt-5.6-luna", name: "Luna (high)", reasoningEffort: "high",
         contextWindow: 1_050_000, slug: "azure", pathPrefix: "/openai/v1",
         api: "openai-responses",
       },
       {
-        id: "luna-max", model: "gpt-5.6-luna", name: "Luna (max)", reasoningEffort: "max",
+        model: "gpt-5.6-luna", name: "Luna (max)", reasoningEffort: "max",
         contextWindow: 1_050_000, slug: "azure", pathPrefix: "/openai/v1",
         api: "openai-responses",
       },
     ])));
 
-    // Distinct entries in the picker, one model at the vendor.
+    // Distinct entries in the picker -- the strength is part of the id -- but one model at the
+    // vendor.
+    const base = "gateway-custom:azure:openai-responses:gpt-5.6-luna";
     expect(config.getModelList().map(m => m.id)).toEqual(
-        expect.arrayContaining(["luna-high", "luna-max"]));
-    for (const [id, effort] of [["luna-high", "high"], ["luna-max", "max"]] as const) {
+        expect.arrayContaining([`${base}:high`, `${base}:max`]));
+    for (const [id, effort] of
+         [[`${base}:high`, "high"], [`${base}:max`, "max"]] as const) {
       const resolved = config.resolveModel(id);
       expect(resolved?.config.model).toBe("gpt-5.6-luna");
       expect(resolved?.config.gatewayCustom?.reasoningEffort).toBe(effort);
@@ -87,7 +93,8 @@ describe("AiGatewayConfig deployment models", () => {
   it("ignores the declaration when the provider is switched off", () => {
     const config = new AiGatewayConfig(customEnv(MODELS, "cloudflare"));
     expect(config.customModels.size).toBe(0);
-    expect(config.resolveModel("gpt-5.6-luna")).toBeUndefined();
+    expect(config.resolveModel(
+        "gateway-custom:azure-sandbox:openai-responses:gpt-5.6-luna")).toBeUndefined();
   });
 
   it("refuses a declaration that would fail later", () => {
@@ -96,18 +103,19 @@ describe("AiGatewayConfig deployment models", () => {
     const bad: [string, string][] = [
       ["not json", "not valid JSON"],
       ['{"id":"x"}', "must be a JSON array"],
-      ['[{"name":"No id","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"}]',
-       "needs both an id and a name"],
-      ['[{"id":"x","name":"X","contextWindow":1,"slug":"..","pathPrefix":"","api":"openai-responses"}]',
+      ['[{"name":"No model","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"}]',
+       "needs both a model and a name"],
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"..","pathPrefix":"","api":"openai-responses"}]',
        "needs a slug"],
-      ['[{"id":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"/../b","api":"openai-responses"}]',
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"/../b","api":"openai-responses"}]',
        "needs a pathPrefix"],
-      ['[{"id":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"grpc"}]',
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"grpc"}]',
        "needs an api of"],
-      ['[{"id":"x","name":"X","slug":"a","pathPrefix":"","api":"openai-responses"}]',
+      ['[{"model":"x","name":"X","slug":"a","pathPrefix":"","api":"openai-responses"}]',
        "positive integer contextWindow"],
-      ['[{"id":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"},' +
-       '{"id":"x","name":"Y","contextWindow":1,"slug":"b","pathPrefix":"","api":"openai-responses"}]',
+      // Same slug, format and model, so both derive the same id -- the case the check exists for.
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"},' +
+       '{"model":"x","name":"Y","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"}]',
        "declared twice"],
     ];
     for (const [models, message] of bad) {
