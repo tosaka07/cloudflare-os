@@ -1244,8 +1244,15 @@ export type GatewayCustomApi = "openai-responses" | "openai-completions" | "anth
  * nobody can get the window wrong in a way that breaks their own compaction budget.
  */
 export type DeploymentCustomModel = GatewayCustomRoute & {
-  /** The id the vendor knows this model by, and the id it is offered under. */
+  /**
+   * The id this model is offered under, unique across the declaration. It is the vendor's own id
+   * unless {@link model} says otherwise, which is what lets one endpoint appear several times --
+   * the same model at different reasoning strengths, say.
+   */
   id: string;
+
+  /** The id the vendor knows it by. Absent means {@link id} already is that id. */
+  model?: string;
 
   /** Display name shown in the model picker. */
   name: string;

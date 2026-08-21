@@ -60,6 +60,30 @@ describe("AiGatewayConfig deployment models", () => {
     expect(resolved?.config.apiToken).toBe("");
   });
 
+  it("lets one endpoint appear several times, at different strengths", () => {
+    const config = new AiGatewayConfig(customEnv(JSON.stringify([
+      {
+        id: "luna-high", model: "gpt-5.6-luna", name: "Luna (high)", reasoningEffort: "high",
+        contextWindow: 1_050_000, slug: "azure", pathPrefix: "/openai/v1",
+        api: "openai-responses",
+      },
+      {
+        id: "luna-max", model: "gpt-5.6-luna", name: "Luna (max)", reasoningEffort: "max",
+        contextWindow: 1_050_000, slug: "azure", pathPrefix: "/openai/v1",
+        api: "openai-responses",
+      },
+    ])));
+
+    // Distinct entries in the picker, one model at the vendor.
+    expect(config.getModelList().map(m => m.id)).toEqual(
+        expect.arrayContaining(["luna-high", "luna-max"]));
+    for (const [id, effort] of [["luna-high", "high"], ["luna-max", "max"]] as const) {
+      const resolved = config.resolveModel(id);
+      expect(resolved?.config.model).toBe("gpt-5.6-luna");
+      expect(resolved?.config.gatewayCustom?.reasoningEffort).toBe(effort);
+    }
+  });
+
   it("ignores the declaration when the provider is switched off", () => {
     const config = new AiGatewayConfig(customEnv(MODELS, "cloudflare"));
     expect(config.customModels.size).toBe(0);

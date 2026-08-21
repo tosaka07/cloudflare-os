@@ -181,12 +181,14 @@ export class AiGatewayConfig {
   resolveModel(modelId: string): UserAiModelRecord | undefined {
     let custom = this.customModels.get(modelId);
     if (custom) {
-      const { id, name, ...route } = custom;
+      const { id, name, model, ...route } = custom;
       return {
         profile: { type: "agent", id, name },
         // apiToken is ignored in AI Gateway mode -- getModel() authenticates with the gateway
         // token and lets the gateway supply the vendor's own key.
-        config: { provider: "gateway-custom", model: id, apiToken: "", gatewayCustom: route },
+        config: {
+          provider: "gateway-custom", model: model ?? id, apiToken: "", gatewayCustom: route,
+        },
       };
     }
     for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
