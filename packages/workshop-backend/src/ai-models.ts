@@ -17,8 +17,8 @@ import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } 
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
 import { AiChatAuthorInfo, AiModelConfig, GatewayCustomReasoningEffort, GatewayCustomRoute,
-  isValidGatewayCustomPathPrefix, isValidGatewayCustomSlug, SUGGESTED_MODELS,
-  WORKERS_AI_OUTPUT_LIMIT } from "@gadgets/workshop-shared/api";
+  isValidGatewayCustomPathPrefix, isValidGatewayCustomSlug, resolveGatewayCustomCost,
+  SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT } from "@gadgets/workshop-shared/api";
 import { AiGatewayConfig, getAiGatewayConfig, type AiGatewayLogRoute } from "./ai-gateway.js";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
@@ -305,7 +305,10 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
         // was registered for, and no catalog is keyed on that vendor's model ids.
         reasoning: route.reasoningEffort !== undefined && route.reasoningEffort !== "off",
         input: ["text", "image"],
-        cost: ZERO_COST,
+        // Declared on the route, since nothing else can price it: no catalog is keyed on the
+        // vendor a Custom Provider serves. Undeclared leaves the turn priced at zero rather than
+        // guessing -- the token counts still land, so only the cost indicator goes quiet.
+        cost: route.cost ? resolveGatewayCustomCost(route.cost) : ZERO_COST,
         contextWindow: route.contextWindow,
         maxTokens: route.outputLimit ?? 4096,
         compat: gatewayCustomCompat(route),

@@ -14,6 +14,31 @@ const GATEWAY_CUSTOM_APIS: GatewayCustomApi[] =
     ["openai-responses", "openai-completions", "anthropic-messages"];
 
 /**
+ * Check a declared {@link GatewayCustomCost}. Rates may be zero -- a free preview endpoint is a
+ * real thing -- but must be finite and non-negative, and the two required fields must be present:
+ * a partial declaration would price half the turn.
+ */
+function validateCustomCost(cost: unknown, fail: (why: string) => void): void {
+  if (typeof cost !== "object" || cost === null || Array.isArray(cost)) {
+    fail("needs a cost object of dollars per million tokens");
+    return;
+  }
+  const rates = cost as Record<string, unknown>;
+  for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+    const value = rates[field];
+    if (value === undefined) {
+      // input and output carry the bulk of a turn either way, so neither may be left out; the
+      // cache rates have documented defaults (see resolveGatewayCustomCost).
+      if (field === "input" || field === "output") fail(`declares a cost without ${field}`);
+      continue;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      fail(`needs a finite, non-negative cost.${field} in dollars per million tokens`);
+    }
+  }
+}
+
+/**
  * Parse CF_AI_GATEWAY_CUSTOM_MODELS: the models this deployment offers to everyone through its
  * Custom Providers, as a JSON array of {@link DeploymentCustomModel}. Declared in env rather than
  * in SUGGESTED_MODELS because a slug and a path are deployment facts, not product ones -- and
@@ -54,6 +79,9 @@ function parseCustomModels(raw: string | undefined): Map<string, DeploymentCusto
     if (!Number.isInteger(entry.contextWindow) || entry.contextWindow! <= 0) {
       fail("needs a positive integer contextWindow");
     }
+    // Optional, but wrong beats absent here: a malformed rate would silently price every turn at
+    // zero, which reads exactly like a model nobody has spent anything on.
+    if ("cost" in entry) validateCustomCost(entry.cost, fail);
     // Keyed on the id it will be offered under, so two entries that differ only in something the
     // id does not carry are caught here rather than shadowing each other in the picker.
     const id = gatewayCustomModelId(entry.model!, entry as DeploymentCustomModel);

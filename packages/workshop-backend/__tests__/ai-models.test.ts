@@ -294,6 +294,38 @@ describe("getModel AI Gateway routing", () => {
     }
   });
 
+  it("prices a turn from the rates the route declares", () => {
+    // No catalog can price a Custom Provider -- it serves whatever vendor it was registered for
+    // -- so the route is the only place these can come from.
+    const handle = getModel(env({ CF_AI_GATEWAY_PROVIDERS: "gateway-custom" }), {
+      ...CUSTOM_CONFIG,
+      gatewayCustom: {
+        ...CUSTOM_CONFIG.gatewayCustom!,
+        cost: { input: 1.25, output: 10, cacheRead: 0.125 },
+      },
+    }, INITIATOR);
+    expect(handle.model.cost).toEqual(
+        { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 });
+  });
+
+  it("charges cache hits at the input rate rather than guessing a discount", () => {
+    // Vendors discount them by varying amounts; assuming one would understate spend on exactly
+    // the workloads that cache best.
+    const handle = getModel(env({ CF_AI_GATEWAY_PROVIDERS: "gateway-custom" }), {
+      ...CUSTOM_CONFIG,
+      gatewayCustom: { ...CUSTOM_CONFIG.gatewayCustom!, cost: { input: 1.25, output: 10 } },
+    }, INITIATOR);
+    expect(handle.model.cost).toEqual(
+        { input: 1.25, output: 10, cacheRead: 1.25, cacheWrite: 0 });
+  });
+
+  it("leaves an undeclared model at zero rather than inventing a rate", () => {
+    // The turn's tokens are still counted; only the cost indicator stays quiet.
+    const handle = getModel(
+        env({ CF_AI_GATEWAY_PROVIDERS: "gateway-custom" }), CUSTOM_CONFIG, INITIATOR);
+    expect(handle.model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  });
+
   it("rejects a route that names no slug or window", () => {
     expect(() => getModel(
         env({ CF_AI_GATEWAY_PROVIDERS: "gateway-custom" }),

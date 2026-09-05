@@ -117,10 +117,44 @@ describe("AiGatewayConfig deployment models", () => {
       ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"},' +
        '{"model":"x","name":"Y","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses"}]',
        "declared twice"],
+      // A malformed rate is worse than none: it would price every turn at zero, which reads
+      // exactly like a model nobody has spent anything on.
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses",' +
+       '"cost":{"output":10}}]', "declares a cost without input"],
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses",' +
+       '"cost":{"input":1.25}}]', "declares a cost without output"],
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses",' +
+       '"cost":{"input":"1.25","output":10}}]', "cost.input"],
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses",' +
+       '"cost":{"input":1.25,"output":10,"cacheRead":-1}}]', "cost.cacheRead"],
+      ['[{"model":"x","name":"X","contextWindow":1,"slug":"a","pathPrefix":"","api":"openai-responses",' +
+       '"cost":null}]', "needs a cost object"],
     ];
     for (const [models, message] of bad) {
       expect(() => new AiGatewayConfig(customEnv(models))).toThrow(message);
     }
+  });
+
+  it("carries a declared price through to the route", () => {
+    const config = new AiGatewayConfig(customEnv(JSON.stringify([
+      {
+        model: "gpt-5.6-luna", name: "Luna (Azure)", contextWindow: 1_050_000,
+        slug: "azure", pathPrefix: "/openai/v1", api: "openai-responses",
+        cost: { input: 1.25, output: 10, cacheRead: 0.125 },
+      },
+    ])));
+    const resolved = config.resolveModel(
+        "gateway-custom:azure:openai-responses:gpt-5.6-luna");
+    expect(resolved?.config.gatewayCustom?.cost).toEqual(
+        { input: 1.25, output: 10, cacheRead: 0.125 });
+  });
+
+  it("leaves a model unpriced when nothing declares a price", () => {
+    // The tokens still land; only the cost indicator stays quiet. Nothing here may invent a rate.
+    const config = new AiGatewayConfig(customEnv(MODELS));
+    const resolved = config.resolveModel(
+        "gateway-custom:azure-sandbox:openai-responses:gpt-5.6-luna");
+    expect(resolved?.config.gatewayCustom?.cost).toBeUndefined();
   });
 });
 

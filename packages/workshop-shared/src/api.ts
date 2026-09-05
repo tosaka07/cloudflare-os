@@ -1233,7 +1233,61 @@ export type GatewayCustomRoute = {
    * an error at most vendors.
    */
   reasoningEffort?: GatewayCustomReasoningEffort;
+
+  /**
+   * What the vendor charges for this model, in dollars per million tokens. Declared rather than
+   * looked up because no catalog can price it: a Custom Provider serves whatever vendor it was
+   * registered for, under that vendor's own model ids. Absent leaves the cost indicator at zero
+   * -- the turn's tokens are still counted, but nothing prices them.
+   */
+  cost?: GatewayCustomCost;
 };
+
+/**
+ * Per-million-token prices for a {@link GatewayCustomRoute}, as the vendor publishes them. The
+ * shape matches what the inference layer multiplies the turn's token counts by, so a declaration
+ * here reaches the cost indicator unchanged.
+ *
+ * The counts these apply to are disjoint: a cached prompt token is reported as a cache read and
+ * excluded from `input`, so pricing depends on both numbers being right.
+ */
+export type GatewayCustomCost = {
+  /** Dollars per million uncached prompt tokens. */
+  input: number;
+
+  /** Dollars per million completion tokens, reasoning tokens included. */
+  output: number;
+
+  /**
+   * Dollars per million prompt tokens served from the vendor's cache. Absent charges them at the
+   * `input` rate: vendors discount cache hits by varying amounts (Azure OpenAI to a tenth of
+   * input, others not at all), and a cost indicator that guessed the discount would understate
+   * spend on exactly the workloads that cache best.
+   */
+  cacheRead?: number;
+
+  /**
+   * Dollars per million prompt tokens written to the vendor's cache. Absent charges nothing,
+   * which is right for the OpenAI-compatible formats: they report no cache-write count, so there
+   * is nothing for a rate to apply to. Set it for a vendor that bills writes and reports them.
+   */
+  cacheWrite?: number;
+};
+
+/**
+ * Applies the defaults documented on {@link GatewayCustomCost}, yielding the four rates the
+ * inference layer needs. Kept here rather than at the one call site so the rule a declaration is
+ * read under is stated once, beside the fields it fills in.
+ */
+export function resolveGatewayCustomCost(cost: GatewayCustomCost):
+    { input: number, output: number, cacheRead: number, cacheWrite: number } {
+  return {
+    input: cost.input,
+    output: cost.output,
+    cacheRead: cost.cacheRead ?? cost.input,
+    cacheWrite: cost.cacheWrite ?? 0,
+  };
+}
 
 /**
  * Wire formats a Custom Provider endpoint can speak. Each names an API implementation that

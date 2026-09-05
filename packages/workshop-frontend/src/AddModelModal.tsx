@@ -49,6 +49,7 @@ const PRESET_MANUAL = '__manual__'
 // same rule, so the wording matches what it would reject.
 const SLUG_ERROR = 'Use only letters, digits and hyphens, starting with a letter or digit'
 const PATH_ERROR = 'Start each segment with a letter or digit, e.g. /openai/v1'
+const PRICE_ERROR = 'Enter dollars per million tokens, e.g. 1.25'
 
 const WIRE_FORMATS: { value: GatewayCustomApi, label: string }[] = [
   { value: 'openai-responses', label: 'OpenAI Responses' },
@@ -137,6 +138,11 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const [outputLimit, setOutputLimit] = useState('')
   const [maxTokensField, setMaxTokensField] = useState('')
   const [reasoningEffort, setReasoningEffort] = useState('')
+  // Prices in dollars per million tokens. Optional as a pair: entering neither leaves the cost
+  // indicator at zero, which is the honest reading of a model nobody has priced.
+  const [inputPrice, setInputPrice] = useState('')
+  const [outputPrice, setOutputPrice] = useState('')
+  const [cachedInputPrice, setCachedInputPrice] = useState('')
 
   // Validation errors
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -167,6 +173,9 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
       setOutputLimit('')
       setMaxTokensField('')
       setReasoningEffort('')
+      setInputPrice('')
+      setOutputPrice('')
+      setCachedInputPrice('')
       setErrors({})
       setAdvancedOpen(false)
     }
@@ -196,6 +205,9 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     setOutputLimit('')
     setMaxTokensField('')
     setReasoningEffort('')
+    setInputPrice('')
+    setOutputPrice('')
+    setCachedInputPrice('')
   }
 
   // Seed the path and format from a known vendor endpoint. Both stay editable afterwards.
@@ -242,6 +254,24 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
         if (!Number.isInteger(limit) || limit <= 0 || limit >= window) {
           newErrors.outputLimit = 'Must be a positive number below the context window'
         }
+      }
+
+      // Priced or unpriced, never half-priced: one rate alone would bill a turn's prompt without
+      // its response, or the reverse, and read as a real total.
+      const price = (raw: string) => raw.trim() ? Number(raw.trim()) : undefined
+      const badPrice = (raw: string) => {
+        const value = price(raw)
+        return value !== undefined && (!Number.isFinite(value) || value < 0)
+      }
+      if (badPrice(inputPrice)) newErrors.inputPrice = PRICE_ERROR
+      if (badPrice(outputPrice)) newErrors.outputPrice = PRICE_ERROR
+      if (badPrice(cachedInputPrice)) newErrors.cachedInputPrice = PRICE_ERROR
+      if (Boolean(inputPrice.trim()) !== Boolean(outputPrice.trim())) {
+        const missing = inputPrice.trim() ? 'outputPrice' : 'inputPrice'
+        newErrors[missing] = 'Enter both prices, or neither'
+      }
+      if (cachedInputPrice.trim() && !inputPrice.trim()) {
+        newErrors.inputPrice = 'Needed to price the rest of the prompt'
       }
     }
 
@@ -294,6 +324,14 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
             }),
             ...(reasoningEffort && {
               reasoningEffort: reasoningEffort as GatewayCustomReasoningEffort,
+            }),
+            // Validated as a pair above, so an input price implies an output one.
+            ...(inputPrice.trim() && {
+              cost: {
+                input: Number(inputPrice.trim()),
+                output: Number(outputPrice.trim()),
+                ...(cachedInputPrice.trim() && { cacheRead: Number(cachedInputPrice.trim()) }),
+              },
             }),
           },
         }),
@@ -506,6 +544,36 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
                         <Select.Option key={e} value={e}>{e}</Select.Option>
                       ))}
                     </Select>
+
+                    <Input
+                      label="Input Price"
+                      placeholder="(unpriced)"
+                      description="Dollars per million prompt tokens, as the vendor publishes them. Leave both prices blank to leave this model's cost unreported."
+                      value={inputPrice}
+                      onChange={(e) => { setInputPrice(e.target.value); setErrors(prev => ({ ...prev, inputPrice: '' })) }}
+                      error={errors.inputPrice}
+                      variant={errors.inputPrice ? 'error' : 'default'}
+                    />
+
+                    <Input
+                      label="Output Price"
+                      placeholder="(unpriced)"
+                      description="Dollars per million completion tokens, reasoning included."
+                      value={outputPrice}
+                      onChange={(e) => { setOutputPrice(e.target.value); setErrors(prev => ({ ...prev, outputPrice: '' })) }}
+                      error={errors.outputPrice}
+                      variant={errors.outputPrice ? 'error' : 'default'}
+                    />
+
+                    <Input
+                      label="Cached Input Price"
+                      placeholder="(same as input)"
+                      description="Dollars per million prompt tokens served from the vendor's cache. Azure OpenAI discounts these to a tenth of input; blank charges them at the full input rate rather than guessing."
+                      value={cachedInputPrice}
+                      onChange={(e) => { setCachedInputPrice(e.target.value); setErrors(prev => ({ ...prev, cachedInputPrice: '' })) }}
+                      error={errors.cachedInputPrice}
+                      variant={errors.cachedInputPrice ? 'error' : 'default'}
+                    />
                   </div>
                 </Collapsible.DefaultPanel>
               </Collapsible.Root>
