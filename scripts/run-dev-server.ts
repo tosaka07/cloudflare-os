@@ -294,7 +294,7 @@ function runBuild(
   });
 }
 
-// Everything Wrangler needs generated before it bundles: the backend's format blueprint module
+// Everything Wrangler needs generated before it bundles: the backend's bundled blueprint module
 // (gitignored, so absent on a clean checkout) and each gatekeeper's UI.
 //
 // The UI groups go through `vp` rather than a loop over `gatekeepers` so they run in parallel and
@@ -309,22 +309,30 @@ function runBuild(
 // this output is rebuilt regardless, and unless the bytes match Wrangler sees `src/generated/app.txt`
 // change and restarts the worker. Same build, unminified.
 //
-// Both `vp` runs get the machine-aware concurrency limit (vp/concurrency.ts); computed once here so
-// its note prints once, and after `loadDevVars()` so a `.dev.vars` override is honoured.
-const vpEnv = vpRunEnv();
-const [pnpm, configuratorArgs] =
-    pnpmCommand(["exec", "vp", "run", "-r", "--cache", "build:configurator", "--dev"]);
-const [, appArgs] = pnpmCommand(["exec", "vp", "run", "-r", "--cache", "build:app:dev"]);
+// The two `vp` runs, listed so the concurrency split below is derived from their number rather than
+// from a literal that a third would silently invalidate. Both share the one machine-aware limit
+// (vp/concurrency.ts), divided between them: each run alone would otherwise claim the whole budget,
+// and the two together twice it. Floored at vp's default of 4, so a small machine is unchanged and a
+// big one stops double-claiming. Computed once, so the note prints once, and after `loadDevVars()`
+// so a `.dev.vars` override is honoured.
+const VP_PREFLIGHT_BUILDS = [
+  {
+    label: "configurator UIs",
+    args: ["exec", "vp", "run", "-r", "--cache", "build:configurator", "--dev"],
+  },
+  { label: "gatekeeper app UIs", args: ["exec", "vp", "run", "-r", "--cache", "build:app:dev"] },
+];
+const vpEnv = vpRunEnv({ concurrentRuns: VP_PREFLIGHT_BUILDS.length });
 try {
   await Promise.all([
     runBuild(
-      "format blueprints",
+      "bundled blueprints",
       process.execPath,
-      [join(WORKSHOP_BACKEND_DIR, "scripts", "build-format-blueprints.ts")],
+      [join(WORKSHOP_BACKEND_DIR, "scripts", "build-bundled-blueprints.ts")],
       WORKSHOP_BACKEND_DIR,
     ),
-    runBuild("configurator UIs", pnpm, configuratorArgs, ROOT, vpEnv),
-    runBuild("gatekeeper app UIs", pnpm, appArgs, ROOT, vpEnv),
+    ...VP_PREFLIGHT_BUILDS.map(({ label, args }) =>
+        runBuild(label, ...pnpmCommand(args), ROOT, vpEnv)),
   ]);
 } catch (err) {
   // The SIGTERM handler killing the builds also lands here, as the rejection of whichever build
@@ -545,6 +553,15 @@ for (const gk of gatekeepers) {
   // they are injected into the gatekeeper Workers (see SHARED_GATEKEEPER_CREDS below).
   for (const name of OPTIONAL_FEATURE_VARS) {
     if (process.env[name] !== undefined) config.vars[name] = process.env[name];
+  }
+
+  // Account connect flows post their completion ticket to the Workshop *origin* named here (see
+  // packages/workshop-backend/src/connect-handoff.ts), so the backend refuses to complete one without
+  // it. Default to wherever the frontend is served from: Vite in normal dev, the backend itself in
+  // run-local mode.
+  if (config.vars.PUBLIC_BASE_URL === undefined) {
+    config.vars.PUBLIC_BASE_URL =
+        serveFrontendAssets ? `http://${backendHost}` : "http://localhost:3000";
   }
 
   for (const gk of gatekeepers) {
