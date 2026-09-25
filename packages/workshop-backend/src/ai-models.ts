@@ -5,6 +5,7 @@ import type {
   ModelCost, OpenAICompletionsCompat, OpenAIResponsesCompat, ProviderHeaders, SimpleStreamOptions,
   StreamFunction,
 } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
 import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/openai-completions";
@@ -404,6 +405,10 @@ function makeHandle(args: HandleArgs): ModelHandle {
   }
 
   const apiExtras = reasoningApiExtras(args.model, args.reasoningEffort);
+  // Read off the model, not from reasoningApiExtras: the thinking-off path below needs it
+  // too, and a managed-effort Anthropic model takes its lowest effort rather than an
+  // outright disable.
+  const anthropicCompat = args.model.compat as AnthropicMessagesCompat | undefined;
 
   const handle: ModelHandle = {
     model: args.model,
@@ -420,13 +425,16 @@ function makeHandle(args: HandleArgs): ModelHandle {
       };
       const merged: SimpleStreamOptions = {
         // API defaults first, so an explicit per-call option can override them. `thinking: false`
-        // replaces them with an explicit thinking-off request: for Anthropic pi sends
-        // `thinking: {type:"disabled"}` (and knows to omit it for models that can't turn thinking
-        // off, e.g. claude-fable-5); for OpenAI Responses, passing no reasoningEffort makes pi
-        // disable reasoning.
+        // replaces them with a quick request. Managed-effort Anthropic models must use adaptive
+        // thinking, so select their lowest effort; other Anthropic models disable it (or omit
+        // the unsupported off setting). For OpenAI Responses, passing no reasoningEffort disables
+        // reasoning.
         ...(thinking
             ? apiExtras
-            : args.model.api === "anthropic-messages" ? { thinkingEnabled: false } : {}),
+            : args.model.api === "anthropic-messages"
+                ? (anthropicCompat?.supportsMidConvoEffort === true
+                    ? { effort: "low" } : { thinkingEnabled: false })
+                : {}),
         ...(args.fetch !== undefined ? { fetch: args.fetch } : {}),
         ...options,
         ...(args.apiKey !== undefined ? { apiKey: args.apiKey } : {}),
@@ -447,7 +455,7 @@ function makeHandle(args: HandleArgs): ModelHandle {
           return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
         },
       };
-      return streamFn(model, context, merged);
+      return streamFn(model, normalizeContext(context), merged);
     },
   };
   return handle;
