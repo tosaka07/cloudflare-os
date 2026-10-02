@@ -108,7 +108,7 @@ describe("compaction trigger", () => {
       expect(getModelTokenLimits({provider: "openai", model, apiToken: ""}))
           .toEqual({inputBudget: 272_000, maxOutputTokens: 128_000});
     }
-    for (let model of ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra"]) {
+    for (let model of ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"]) {
       expect(getModelTokenLimits({provider: "openai", model, apiToken: ""}))
           .toEqual({inputBudget: 272_000, maxOutputTokens: 128_000});
     }
@@ -123,6 +123,19 @@ describe("compaction trigger", () => {
     // Other providers fall back to the assumed window with nothing withheld.
     expect(getModelTokenLimits({provider: "ollama", model: "local", apiToken: ""}))
         .toEqual({inputBudget: 128_000, maxOutputTokens: undefined});
+  });
+
+  it("lets the model config override the window and output limit", () => {
+    expect(getModelTokenLimits({
+      provider: "anthropic", model: "claude-unlisted", apiToken: "",
+      contextWindow: 1_000_000, outputLimit: 64_000,
+    })).toEqual({inputBudget: 936_000, maxOutputTokens: 64_000});
+
+    // An override beats the model table, too.
+    expect(getModelTokenLimits({
+      provider: "cloudflare", model: "@cf/moonshotai/kimi-k2.7-code", apiToken: "",
+      outputLimit: 16_384,
+    })).toEqual({inputBudget: 245_760, maxOutputTokens: 16_384});
   });
 
   it("recognizes /compact as the newest message, and only there", () => {

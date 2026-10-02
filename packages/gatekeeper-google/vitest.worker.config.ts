@@ -1,19 +1,23 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
 import { defineConfig } from "vitest/config";
+import deployed from "./cloudflare.config.ts";
 
-/** Workerd coverage for Google resource configurators, Gmail sessions, and the Gmail Durable Object. */
+const { compatibilityDate, compatibilityFlags } = deployed.worker;
+
+/** Workerd coverage for Google resource configurators and the Gmail and Chat Durable Objects. */
 export default defineConfig({
   plugins: [
     capnwebValidate(),
     cloudflareTest({
       main: "./__tests__/workerd/worker.ts",
       miniflare: {
-        compatibilityDate: "2026-09-04",
-        compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
+        compatibilityDate,
+        compatibilityFlags,
         bindings: {CLIENT_ID: "test-client", CLIENT_SECRET: "test-secret"},
         durableObjects: {
           GmailGatekeeperImpl: {className: "GmailGatekeeperImpl", useSQLite: true},
+          GoogleChatGatekeeperImpl: {className: "GoogleChatGatekeeperImpl", useSQLite: true},
           TestHooks: {className: "TestHooks", useSQLite: true},
           UserAccount: {className: "UserAccount", useSQLite: true},
         },
@@ -22,6 +26,7 @@ export default defineConfig({
   ],
   test: {
     include: [
+      "__tests__/workerd/chat-actions.test.ts",
       "__tests__/workerd/configurators.test.ts",
       "__tests__/workerd/gmail-actions.test.ts",
       "__tests__/workerd/gmail-state.test.ts",
